@@ -31,6 +31,9 @@ luci-app-ocserv
 luci-proto-openconnect
 openconnect
 
+# Client steering between bands and access points (Network -> usteer)
+luci-app-usteer
+
 # Statistics
 luci-app-statistics
 collectd-mod-cpu
