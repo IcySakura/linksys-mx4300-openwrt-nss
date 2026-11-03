@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Myles Liu <lyx981mike@gmail.com>
+Date: Mon, 2 Nov 2026 19:43:35 -0800
+Subject: [PATCH] qualcommax: ipq807x: allow holding the boot counter reset
+
+A firmware updater that tries out a new image needs the boot counter to
+keep counting until it has decided to keep the image: then U-Boot falls
+back to the previous partition when the new firmware does not come up.
+Skip the reset while /var/run/bootcount.hold exists.
+---
+ .../linux/qualcommax/ipq807x/base-files/etc/init.d/bootcount  | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/target/linux/qualcommax/ipq807x/base-files/etc/init.d/bootcount b/target/linux/qualcommax/ipq807x/base-files/etc/init.d/bootcount
+index e7c2049..2e457c2 100755
+--- a/target/linux/qualcommax/ipq807x/base-files/etc/init.d/bootcount
++++ b/target/linux/qualcommax/ipq807x/base-files/etc/init.d/bootcount
+@@ -3,6 +3,10 @@
+ START=99
+ 
+ boot() {
++	# A firmware update being tried out keeps the count until it is
++	# confirmed, so that U-Boot can fall back to the previous firmware.
++	[ -e /var/run/bootcount.hold ] && return 0
++
+ 	case $(board_name) in
+ 	edgecore,eap102|\
+ 	yuncore,ax880)
+-- 
+2.56.0
+

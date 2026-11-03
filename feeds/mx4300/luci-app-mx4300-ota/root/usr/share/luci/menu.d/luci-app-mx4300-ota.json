@@ -1,0 +1,13 @@
+{
+	"admin/system/mx4300-ota": {
+		"title": "Firmware Update",
+		"order": 75,
+		"action": {
+			"type": "view",
+			"path": "mx4300-ota"
+		},
+		"depends": {
+			"acl": [ "luci-app-mx4300-ota" ]
+		}
+	}
+}

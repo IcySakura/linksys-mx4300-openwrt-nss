@@ -1,0 +1,442 @@
+#!/bin/sh
+# Over-the-air updates from the GitHub releases of a build repository.
+#
+#   mx4300-ota status              installed firmware, trial and job state (JSON)
+#   mx4300-ota list                releases on the channel, newest first (JSON)
+#   mx4300-ota check               the newest release on the channel (JSON)
+#   mx4300-ota upgrade [-y] [TAG]  download, verify and flash a release
+#                                (default: the newest on the channel)
+#   mx4300-ota start [TAG]         the same, detached (used by LuCI); see "status"
+#   mx4300-ota confirm             keep the firmware being tried
+#   mx4300-ota rollback            reboot into the previous firmware
+#
+# Channels: "stable" offers the releases that are not marked as pre-releases
+# on GitHub, "testing" offers all of them.
+#
+# An upgrade is flashed into the other boot partition. Its first boot is a
+# trial: the boot counter is not reset until "confirm" is run or, after
+# trial_timeout seconds, the health check passes (on_timeout=confirm).
+# A trial that is not confirmed switches back to the previous partition and
+# reboots; one that never gets that far (no boot, hang) is undone by U-Boot,
+# which boots the other partition after maxpartialboots (3) failed boots.
+#
+# Settings: /etc/config/mx4300-ota. The release repository defaults to the one
+# that built the running image (OTA_REPO in /etc/mx4300-nss/build-info).
+
+. /lib/functions.sh
+. /usr/share/libubox/jshn.sh
+
+BUILD_INFO=/etc/mx4300-nss/build-info
+WORK=/tmp/mx4300-ota
+JOB=$WORK/job
+HOLD=/var/run/bootcount.hold
+DEADLINE=/var/run/mx4300-ota.deadline
+LAST=/etc/mx4300-ota/last-result
+# "<release> <partition>": set before an upgrade, cleared once it is decided
+ENV_TRIAL=mx4300_ota_trial
+
+die() {
+	echo "mx4300-ota: $*" >&2
+	[ -n "$IN_JOB" ] && job_set error "$*"
+	exit 1
+}
+
+info() {
+	grep "^$1=" "$BUILD_INFO" 2>/dev/null | cut -d= -f2-
+}
+
+# Name of the running firmware for messages
+version() {
+	local tag=$(info RELEASE_TAG)
+
+	echo "${tag:-the local build from $(info BUILD_DATE)}"
+}
+
+load_config() {
+	config_load mx4300-ota
+	config_get REPO main repo
+	config_get PUBKEY main pubkey /etc/mx4300-nss/release.pub
+	config_get CHANNEL main channel
+	if [ -z "$CHANNEL" ]; then
+		# settings from before channels existed
+		config_get_bool pre main prerelease 0
+		CHANNEL=stable
+		[ "$pre" = 1 ] && CHANNEL=testing
+	fi
+	config_get_bool ALLOW_UNSIGNED main allow_unsigned 0
+	config_get TRIAL_TIMEOUT main trial_timeout 600
+	config_get ON_TIMEOUT main on_timeout confirm
+	config_get CHECK_HOST main check_host
+	[ -n "$REPO" ] || REPO=$(info OTA_REPO)
+	PROFILE=$(info PROFILE)
+}
+
+job_set() {
+	mkdir -p "$WORK"
+	printf '%s\n%s\n' "$1" "$2" > "$JOB.tmp" && mv "$JOB.tmp" "$JOB"
+	logger -t mx4300-ota "$1${2:+: $2}"
+}
+
+uptime_s() {
+	cut -d. -f1 /proc/uptime
+}
+
+getenv() {
+	fw_printenv -n "$1" 2>/dev/null
+}
+
+setenv() {
+	fw_setenv "$@" 2>/dev/null
+}
+
+# Boot partition of the running firmware: 1 (rootfs) or 2 (alt_rootfs), from
+# the UBI device U-Boot handed the kernel
+running_part() {
+	local n=$(sed -n 's/.*ubi\.mtd=\([0-9]*\).*/\1/p' /proc/cmdline)
+
+	[ -n "$n" ] || return 0
+	case "$(sed -n "s/^mtd$n: [0-9a-f]* [0-9a-f]* \"\(.*\)\"$/\1/p" /proc/mtd)" in
+	rootfs) echo 1 ;;
+	alt_rootfs) echo 2 ;;
+	esac
+}
+
+# The running firmware is on trial if an upgrade put it into this partition
+# and it has not been confirmed yet.
+in_trial() {
+	local trial=$(getenv $ENV_TRIAL)
+
+	[ -n "$trial" ] && [ "${trial##* }" = "$(running_part)" ]
+}
+
+# Reset the boot counter, as /etc/init.d/bootcount does on every boot
+confirm_boot() {
+	mtd resetbc s_env
+}
+
+fetch() {
+	uclient-fetch -q -T 30 -O "$2" "$1" || { rm -f "$2"; return 1; }
+}
+
+fetch_releases() {
+	[ -n "$REPO" ] || die "no release repository configured (mx4300-ota.main.repo)"
+	[ -n "$PROFILE" ] || die "unknown image profile (no PROFILE in $BUILD_INFO)"
+	mkdir -p "$WORK"
+	fetch "https://api.github.com/repos/$REPO/releases?per_page=30" "$WORK/releases.json" ||
+		die "cannot fetch the release list of $REPO"
+}
+
+# Release number $1 of the list (newest first) -> REL_*; fails past the end
+rel_load() {
+	local T= D= P= R= U= A=
+
+	eval "$(jsonfilter -i "$WORK/releases.json" -e "T=@[$1].tag_name" -e "D=@[$1].published_at" \
+		-e "P=@[$1].prerelease" -e "R=@[$1].draft" -e "U=@[$1].html_url" -e "A=@[$1].assets[*].name" 2>/dev/null)"
+	[ -n "$T" ] || return 1
+
+	REL_TAG=$T REL_DATE=$D REL_URL=$U REL_DRAFT=$R
+	REL_CHANNEL=stable
+	case "$P" in 1|true) REL_CHANNEL=testing ;; esac
+	A=$(echo $A | tr ' ' '\n')
+	REL_IMAGE=$(echo "$A" | grep -e "-$PROFILE-squashfs-sysupgrade\.bin$" | head -n1)
+	REL_SIGNED=0
+	echo "$A" | grep -qx sha256sums.sig && REL_SIGNED=1
+	REL_SIZE=0
+	[ -z "$REL_IMAGE" ] ||
+		REL_SIZE=$(jsonfilter -i "$WORK/releases.json" -e "@[$1].assets[@.name='$REL_IMAGE'].size")
+	REL_BASE="https://github.com/$REPO/releases/download/$REL_TAG"
+}
+
+# Whether the loaded release is offered on the configured channel
+rel_offered() {
+	case "$REL_DRAFT" in 1|true) return 1 ;; esac
+	[ -n "$REL_IMAGE" ] && { [ "$CHANNEL" = testing ] || [ "$REL_CHANNEL" = stable ]; }
+}
+
+# "2026-11-02T23:42:05Z" -> 20261102234205
+datenum() {
+	echo "$1" | tr -cd 0-9
+}
+
+# Date of the installed release (its build date if it is not in the list)
+installed_date() {
+	local tag=$(info RELEASE_TAG) d=
+
+	[ -z "$tag" ] || d=$(jsonfilter -i "$WORK/releases.json" -e "@[@.tag_name='$tag'].published_at" 2>/dev/null)
+	echo "${d:-$(info BUILD_DATE)}"
+}
+
+# How the loaded release relates to the installed one: installed/newer/older
+rel_relation() {
+	local inst=$1
+
+	if [ "$REL_TAG" = "$(info RELEASE_TAG)" ]; then
+		echo installed
+	elif [ "$(datenum "$REL_DATE")" -gt "$(datenum "$inst")" ]; then
+		echo newer
+	else
+		echo older
+	fi
+}
+
+# Release $1 (any channel), or the newest one on the channel -> REL_*
+find_release() {
+	local i=0
+
+	case "$1" in *[!A-Za-z0-9._-]*) die "bad release name: $1" ;; esac
+	fetch_releases
+	while rel_load $i; do
+		if [ -n "$1" ]; then
+			if [ "$REL_TAG" = "$1" ]; then
+				[ -n "$REL_IMAGE" ] || die "release $1 has no image for profile $PROFILE"
+				return 0
+			fi
+		elif rel_offered; then
+			return 0
+		fi
+		i=$((i + 1))
+	done
+	[ -z "$1" ] || die "no release $1 among the 30 newest of $REPO"
+	die "no $CHANNEL release of $REPO has an image for profile $PROFILE"
+}
+
+json_add_release() {
+	json_add_string tag "$REL_TAG"
+	json_add_string date "$REL_DATE"
+	json_add_string url "$REL_URL"
+	json_add_string channel "$REL_CHANNEL"
+	json_add_string image "$REL_IMAGE"
+	json_add_int size "${REL_SIZE:-0}"
+	json_add_boolean signed "$REL_SIGNED"
+	json_add_string relation "$(rel_relation "$1")"
+}
+
+cmd_status() {
+	local slot state msg deadline left=0 got=0
+
+	load_config
+	slot=$(running_part)
+
+	json_init
+	json_add_object installed
+	json_add_string tag "$(info RELEASE_TAG)"
+	json_add_string profile "$PROFILE"
+	json_add_string repo "$(info OTA_REPO)"
+	json_add_string commit "$(info REPO_COMMIT)"
+	json_add_string date "$(info BUILD_DATE)"
+	json_close_object
+	json_add_string repo "$REPO"
+	json_add_int slot "${slot:--1}"
+
+	json_add_object trial
+	if in_trial; then
+		json_add_boolean active 1
+		json_add_boolean held "$([ -e "$HOLD" ] && echo 1 || echo 0)"
+		deadline=$(cat "$DEADLINE" 2>/dev/null)
+		[ -n "$deadline" ] && left=$((deadline - $(uptime_s)))
+		[ "$left" -lt 0 ] && left=0
+		json_add_int remaining "$left"
+		json_add_string on_timeout "$ON_TIMEOUT"
+	else
+		json_add_boolean active 0
+	fi
+	json_close_object
+
+	json_add_object job
+	if [ -s "$JOB" ]; then
+		state=$(sed -n 1p "$JOB")
+		msg=$(sed -n 2p "$JOB")
+		json_add_string state "$state"
+		json_add_string message "$msg"
+		if [ "$state" = downloading ]; then
+			got=$(wc -c < "$WORK/firmware.bin" 2>/dev/null || echo 0)
+			json_add_int received "$got"
+		fi
+	else
+		json_add_string state idle
+	fi
+	json_close_object
+
+	[ -s "$LAST" ] && json_add_string last_result "$(cat "$LAST")"
+	json_dump
+}
+
+cmd_list() {
+	local i=0 inst
+
+	load_config
+	fetch_releases
+	inst=$(installed_date)
+
+	json_init
+	json_add_string repo "$REPO"
+	json_add_string channel "$CHANNEL"
+	json_add_string profile "$PROFILE"
+	json_add_string installed "$(info RELEASE_TAG)"
+	json_add_array releases
+	while rel_load $i; do
+		if rel_offered; then
+			json_add_object
+			json_add_release "$inst"
+			json_close_object
+		fi
+		i=$((i + 1))
+	done
+	json_close_array
+	json_dump
+}
+
+cmd_check() {
+	local relation
+
+	load_config
+	find_release
+	relation=$(rel_relation "$(installed_date)")
+
+	json_init
+	json_add_string repo "$REPO"
+	json_add_string channel "$CHANNEL"
+	json_add_release "$(installed_date)"
+	json_add_string installed "$(info RELEASE_TAG)"
+	json_add_boolean update_available "$([ "$relation" = newer ] && echo 1 || echo 0)"
+	json_dump
+}
+
+cmd_upgrade() {
+	local sum yes= tag= part
+
+	[ "$1" = -y ] && { yes=1; shift; }
+	tag=$1
+	load_config
+	in_trial && die "the running firmware is on trial: confirm or roll it back first"
+	part=$(running_part)
+	[ -n "$part" ] || die "cannot tell the running boot partition; not a Linksys MX4300?"
+
+	job_set checking "Looking up ${tag:-the newest $CHANNEL release} in $REPO"
+	find_release "$tag"
+	[ "$REL_SIGNED" = 1 ] || [ "$ALLOW_UNSIGNED" = 1 ] ||
+		die "release $REL_TAG is not signed (set mx4300-ota.main.allow_unsigned=1 to accept that)"
+
+	if [ -z "$yes" ]; then
+		echo "Install $REL_TAG ($REL_IMAGE) from $REPO into the other boot partition? [y/N]"
+		read -r answer
+		[ "$answer" = y ] || exit 1
+	fi
+
+	rm -f "$WORK/firmware.bin" "$WORK/sha256sums" "$WORK/sha256sums.sig" "$WORK/releases.json"
+	job_set downloading "$REL_TAG: $REL_IMAGE ($REL_SIZE bytes)"
+	fetch "$REL_BASE/sha256sums" "$WORK/sha256sums" || die "cannot download sha256sums"
+	fetch "$REL_BASE/$REL_IMAGE" "$WORK/firmware.bin" || die "cannot download $REL_IMAGE"
+
+	job_set verifying "$REL_TAG"
+	if [ "$REL_SIGNED" = 1 ]; then
+		[ -s "$PUBKEY" ] || die "no public key at $PUBKEY"
+		fetch "$REL_BASE/sha256sums.sig" "$WORK/sha256sums.sig" || die "cannot download sha256sums.sig"
+		usign -V -q -m "$WORK/sha256sums" -p "$PUBKEY" ||
+			die "the signature of $REL_TAG does not match $PUBKEY"
+	fi
+	sum=$(awk -v f="$REL_IMAGE" '$2 == f || $2 == "*" f { print $1 }' "$WORK/sha256sums")
+	[ -n "$sum" ] || die "$REL_IMAGE is not listed in sha256sums"
+	[ "$(sha256sum "$WORK/firmware.bin" | cut -d' ' -f1)" = "$sum" ] ||
+		die "checksum mismatch for $REL_IMAGE"
+	sysupgrade -T "$WORK/firmware.bin" >/dev/null 2>&1 ||
+		die "sysupgrade rejects $REL_IMAGE (wrong board?)"
+
+	# sysupgrade writes the partition boot_part does not name: make sure that
+	# is not the running one (U-Boot may have fallen back without saving it).
+	[ "$(getenv boot_part)" = "$part" ] || setenv boot_part "$part" ||
+		die "cannot write the U-Boot environment"
+	# Picked up by the new firmware's boot: hold the boot counter reset (see
+	# /etc/init.d/mx4300-ota). Cleared again if the upgrade does not start.
+	setenv $ENV_TRIAL "$REL_TAG $((3 - part))" || die "cannot write the U-Boot environment"
+	rm -f "$LAST"
+	job_set flashing "$REL_TAG: writing the other partition, then rebooting"
+	sync
+	sysupgrade "$WORK/firmware.bin"
+	setenv $ENV_TRIAL
+	die "sysupgrade failed"
+}
+
+cmd_start() {
+	case "$1" in *[!A-Za-z0-9._-]*) die "bad release name: $1" ;; esac
+	mkdir -p "$WORK"
+	case "$(sed -n 1p "$JOB" 2>/dev/null)" in
+	checking|downloading|verifying|flashing) die "an update is already running" ;;
+	esac
+	job_set checking "Starting"
+	# Fully detached: rpcd (LuCI) would otherwise wait for the job
+	IN_JOB=1 start-stop-daemon -S -b -x /usr/sbin/mx4300-ota -- upgrade -y $1
+	echo "started"
+}
+
+# Keep the trial firmware: reset the boot counter so U-Boot stays on it.
+cmd_confirm() {
+	in_trial || die "the running firmware is not on trial"
+	confirm_boot || die "cannot reset the boot counter"
+	setenv $ENV_TRIAL
+	rm -f "$HOLD" "$DEADLINE"
+	mkdir -p "${LAST%/*}"
+	echo "Kept $(version) on $(date)" > "$LAST"
+	logger -t mx4300-ota "trial confirmed"
+	/etc/init.d/mx4300-ota stop 2>/dev/null
+	echo "confirmed"
+}
+
+# Boot the previous partition again. The marker stays: the previous
+# firmware finds it on its boot and records the rollback.
+cmd_rollback() {
+	local part
+
+	in_trial || die "the running firmware is not on trial; flash the previous release instead"
+	part=$(running_part)
+	setenv boot_part $((3 - part)) || die "cannot write the U-Boot environment"
+	logger -t mx4300-ota "trial rejected, rebooting into the previous partition"
+	echo "rebooting into the previous firmware"
+	sync
+	reboot
+}
+
+healthy() {
+	local host=$CHECK_HOST
+
+	[ "$(ubus call network.interface.lan status 2>/dev/null | jsonfilter -e @.up)" = true ] || return 1
+	[ -n "$host" ] || host=$(ip -4 route show default | awk '{ print $3; exit }')
+	[ -z "$host" ] || ping -q -c 3 -W 2 "$host" >/dev/null 2>&1
+}
+
+# Started by the init script during a held trial boot.
+cmd_watch() {
+	local left
+
+	load_config
+	[ -s "$DEADLINE" ] || echo $(($(uptime_s) + TRIAL_TIMEOUT)) > "$DEADLINE"
+	logger -t mx4300-ota "trial boot: keep or roll back within $TRIAL_TIMEOUT s, then: $ON_TIMEOUT"
+	while in_trial; do
+		left=$(($(cat "$DEADLINE") - $(uptime_s)))
+		[ "$left" -le 0 ] && break
+		sleep $((left < 10 ? left : 10))
+	done
+	in_trial || exit 0
+
+	if [ "$ON_TIMEOUT" = confirm ] && healthy; then
+		cmd_confirm
+	else
+		logger -t mx4300-ota "trial not confirmed (health check $(healthy && echo passed || echo failed))"
+		cmd_rollback
+	fi
+}
+
+case "$1" in
+status) cmd_status ;;
+list) cmd_list ;;
+check) cmd_check ;;
+upgrade) shift; cmd_upgrade "$@" ;;
+start) cmd_start "$2" ;;
+confirm) cmd_confirm ;;
+rollback) cmd_rollback ;;
+watch) cmd_watch ;;
+*)
+	sed -n '2,/^$/s/^# \{0,1\}//p' "$0" >&2
+	exit 2
+	;;
+esac

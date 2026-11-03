@@ -1,0 +1,9 @@
+# Packages every profile gets. A profile can leave one out with "-name".
+#
+# Firmware updates from this repository's GitHub releases (feeds/mx4300/):
+# System -> Firmware Update in LuCI, or "mx4300-ota" on the command line.
+# To build without them, put these two lines in your profile:
+#   -luci-app-mx4300-ota
+#   -mx4300-ota
+mx4300-ota
+luci-app-mx4300-ota

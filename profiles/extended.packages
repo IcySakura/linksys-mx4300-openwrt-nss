@@ -1,0 +1,73 @@
+# A fuller router: proxy (Passwall with Xray), tunnels and VPN server,
+# dynamic DNS, statistics, USB tethering and a few tools. Shows how software
+# from third-party feeds (upstream/third-party.conf) gets into an image.
+# Format: see default.packages. Lines ending in _INCLUDE_* are Passwall's
+# build options (CONFIG_PACKAGE_luci-app-passwall_INCLUDE_*).
+
+# Passwall with Xray only; the other cores it offers by default are left out
+luci-app-passwall
+luci-app-passwall_INCLUDE_Xray
+luci-app-passwall_INCLUDE_V2ray_Geodata
+-luci-app-passwall_INCLUDE_Geoview
+-luci-app-passwall_INCLUDE_SmartDNS
+-luci-app-passwall_INCLUDE_Haproxy
+-luci-app-passwall_INCLUDE_Shadowsocks_Rust_Client
+-luci-app-passwall_INCLUDE_ShadowsocksR_Libev_Client
+-luci-app-passwall_INCLUDE_Simple_Obfs
+-luci-app-passwall_INCLUDE_SingBox
+-luci-app-passwall_INCLUDE_V2ray_Plugin
+xray-core
+
+# Web UI theme (third-party)
+luci-theme-aurora
+
+# Cloudflare tunnel, dynamic DNS
+luci-app-cloudflared
+luci-app-ddns
+ddns-scripts-cloudflare
+
+# VPN: OpenConnect server and client
+luci-app-ocserv
+luci-proto-openconnect
+openconnect
+
+# Statistics
+luci-app-statistics
+collectd-mod-cpu
+collectd-mod-interface
+collectd-mod-iwinfo
+collectd-mod-load
+collectd-mod-memory
+collectd-mod-network
+collectd-mod-rrdtool
+
+# mDNS
+avahi-daemon-service-http
+dbus-utils
+
+# Phone tethering over USB (iPhone and Android)
+usbmuxd
+kmod-usb-net-ipheth
+kmod-usb-net-rndis
+kmod-usb-net-cdc-ether
+kmod-usb-net-cdc-eem
+kmod-usb-net-cdc-subset
+kmod-usb3
+kmod-usb-dwc3-qcom
+
+# TCP BBR (net.ipv4.tcp_congestion_control)
+kmod-tcp-bbr
+
+# Tools
+bind-host
+curl
+e2fsprogs
+htop
+iperf3
+jq
+losetup
+openssl-util
+speedtestcpp
+tcpdump
+unzip
+usbutils

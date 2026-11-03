@@ -1,0 +1,21 @@
+{
+	"luci-app-mx4300-ota": {
+		"description": "Grant access to firmware updates (mx4300-ota)",
+		"read": {
+			"file": {
+				"/usr/sbin/mx4300-ota status": [ "exec" ],
+				"/usr/sbin/mx4300-ota list": [ "exec" ],
+				"/usr/sbin/mx4300-ota check": [ "exec" ]
+			},
+			"uci": [ "mx4300-ota" ]
+		},
+		"write": {
+			"file": {
+				"/usr/sbin/mx4300-ota start *": [ "exec" ],
+				"/usr/sbin/mx4300-ota confirm": [ "exec" ],
+				"/usr/sbin/mx4300-ota rollback": [ "exec" ]
+			},
+			"uci": [ "mx4300-ota" ]
+		}
+	}
+}
