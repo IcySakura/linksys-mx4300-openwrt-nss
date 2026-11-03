@@ -78,6 +78,9 @@ for s in etc/init.d/bootcount lib/upgrade/platform.sh; do
 	check "sh -n /$s" "sh -n '$R/$s'"
 done
 
+# Package sources must all exist on downloads.openwrt.org (apk update fails otherwise)
+check "package sources: only feeds OpenWrt publishes" "! grep -E '^https?://' '$R/etc/apk/repositories.d/distfeeds.list' | grep -vqE '/(targets/[^/]+/[^/]+/packages|packages/[^/]+/(base|packages|luci|routing|telephony|video))/packages\\.adb\$'"
+
 if [ -e "$R/usr/sbin/mx4300-ota" ]; then
 	check "sh -n /usr/sbin/mx4300-ota" "sh -n '$R/usr/sbin/mx4300-ota'"
 	check "mx4300-ota init enabled (S98, before the S99 bootcount reset)" "ls '$R'/etc/rc.d/ | grep -q '^S98mx4300-ota$'"

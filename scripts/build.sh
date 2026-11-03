@@ -167,6 +167,14 @@ for PROFILE in "${PROFILES[@]}"; do
 	dropped=$(grep -E '^CONFIG_[A-Za-z0-9_-]+=' "$TOP/configs/mx4300-nss.config" | grep -v '=n$' |
 		while read -r l; do grep -qxF "$l" .config || echo "$l"; done)
 	[ -z "$dropped" ] || { echo "defconfig dropped from configs/mx4300-nss.config:" >&2; echo "$dropped" >&2; exit 1; }
+	# The router's package sources (/etc/apk/repositories.d/distfeeds.list)
+	# list a feed when its CONFIG_FEED_ is set. Only the feeds OpenWrt
+	# publishes exist on downloads.openwrt.org; the others are built into the
+	# image, and an unreachable source makes "apk update" fail.
+	for f in $(awk '/^src-/ { print $2 }' feeds.conf); do
+		case "$f" in packages|luci|routing|telephony|video) continue ;; esac
+		sed -i "s/^CONFIG_FEED_$f=y\$/# CONFIG_FEED_$f is not set/" .config
+	done
 	"$TOP/scripts/profile.sh" check .config "$TOP/configs/base.packages" "$TOP/profiles/$PROFILE.packages"
 
 	rm -f "$BIN"/*"$DEV"*
