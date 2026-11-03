@@ -77,7 +77,7 @@ Any recent OpenWrt on the MX4300 (stock 24.10/25.12 or another build):
 
 The firmware you came from stays in the other partition. Packages you had
 installed with `apk add` are not carried over: put them in a profile first
-([Profiles](#profiles-building-the-packages-you-use)).
+([Packages](#packages)).
 
 After the first boot:
 
@@ -175,26 +175,64 @@ The updater is not tied to this repository:
   `configs/base.packages`. The boot counter hold in `patches/0001` does
   nothing without the updater.
 
-## Profiles: building the packages you use
+## Packages
 
-A profile, `profiles/<name>.packages`, lists packages on top of the base config
-(`configs/mx4300-nss.config`) and the packages every profile gets
-(`configs/base.packages`: the firmware updater), one per line; `-name` leaves
-a package out. Two profiles come with the repository:
+### What the images contain
 
-- `default`: the base image (LuCI, offload, SQM, firmware updates).
-- `extended`: a fuller router - Passwall with Xray, the Aurora theme,
-  Cloudflare tunnel, dynamic DNS, an OpenConnect VPN server, statistics, USB
-  phone tethering and some tools. An example of third-party software in a
-  profile; trim it to what you use.
+Every image is built from three layers:
+
+| Layer | File | Contents |
+|---|---|---|
+| Base | `configs/mx4300-nss.config` | OpenWrt with LuCI over HTTPS, PPE flow offload, NSS Wi-Fi offload (`kmod-nss-wifi-drv`, NSS firmware 12.5), SQM with the PPE shaper (`sqm-scripts`, `luci-app-sqm`, `luci-app-qca-ppe-qos`), OpenSSL (`apk-openssl`, `wpad-openssl`), `kmod-tun`, `kmod-wireguard`, USB storage, `ppe-help`, crash logs (`kmod-ramoops`) |
+| Every profile | `configs/base.packages` | `mx4300-ota`, `luci-app-mx4300-ota` (the [firmware updater](#firmware-updates)) |
+| One profile | `profiles/<name>.packages` | what that profile adds or leaves out |
+
+The profiles in this repository:
+
+| Profile | Adds |
+|---|---|
+| `default` | nothing |
+| `extended` | Proxy: `luci-app-passwall` with `xray-core`, V2Ray geodata and `geoview` (its other cores - sing-box, HAProxy, SmartDNS, Shadowsocks, SSR, simple-obfs, v2ray-plugin - left out). Theme: `luci-theme-aurora`. Tunnels and VPN: `luci-app-cloudflared`, `luci-app-ocserv`, `luci-proto-openconnect`, `openconnect`. Dynamic DNS: `luci-app-ddns`, `ddns-scripts-cloudflare`. Statistics: `luci-app-statistics` with the cpu, interface, iwinfo, load, memory, network and rrdtool plugins. mDNS: `avahi-daemon-service-http`, `dbus-utils`. USB phone tethering: `usbmuxd`, `kmod-usb-net-ipheth`, `kmod-usb-net-rndis`, `kmod-usb-net-cdc-ether`, `kmod-usb-net-cdc-eem`, `kmod-usb-net-cdc-subset`, `kmod-usb3`, `kmod-usb-dwc3-qcom`. TCP BBR: `kmod-tcp-bbr`. Tools: `bind-host`, `curl`, `e2fsprogs`, `htop`, `iperf3`, `jq`, `losetup`, `openssl-util`, `speedtestcpp`, `tcpdump`, `unzip`, `usbutils` |
+
+The complete package list of an image is in its release as
+`*-<profile>.manifest`, and on a running router in `apk list --installed`.
+The router also keeps the profile it was built from in
+`/etc/mx4300-nss/profile.packages`.
+
+### Adding or removing packages
+
+Packages installed on the router with `apk add` last only until the next
+upgrade, which replaces the whole system image, and kernel modules cannot be
+installed that way at all (the kernel is not an official OpenWrt one). To keep
+a package, build it into your images:
+
+1. Fork this repository (or work in your copy).
+2. Edit a profile, or copy one to `profiles/<your-name>.packages`. One package
+   per line, `#` starts a comment:
+
+   ```
+   # add a package
+   luci-app-upnp
+   # leave out a package the base or another layer includes
+   -luci-app-sqm
+   ```
+
+   Package names are those of the feeds: search them with `apk search` on a
+   router, in [the OpenWrt package table](https://openwrt.org/packages/start),
+   or with `make menuconfig` in `build/openwrt` after a local build.
+   Dependencies are added automatically. Build options of a package go in the
+   same way when its Kconfig names them `PACKAGE_<package>_<option>`, as
+   Passwall's are: `luci-app-passwall_INCLUDE_SingBox` builds sing-box in,
+   `-luci-app-passwall_INCLUDE_SingBox` leaves it out.
+3. Build: push and run *Actions → Build firmware* with your profile in
+   **profiles**, or locally `scripts/build.sh --profile <your-name>`.
+4. Install the new release on the router (*System → Firmware Update*).
 
 The build **fails** if a listed package does not make it into the image
 (unknown name, missing feed, unmet dependency), so an upgrade never drops
-software silently. Build options of a package go in the same way when they are
-named `PACKAGE_<name>_<option>` in its Kconfig, as Passwall's are:
-`-luci-app-passwall_INCLUDE_SingBox` leaves sing-box out.
+software silently.
 
-To turn a running router into a profile:
+To turn what a running router has into a profile:
 
 ```sh
 scripts/router-packages.sh root@<router> > profiles/my-router.packages
@@ -204,15 +242,32 @@ It starts from the profile the router's image was built from and adds what
 was installed (and `-name` for what was removed) since. Review it before
 committing - it lists everything you run.
 
-**Third-party software** goes in `upstream/third-party.conf`, one source per
-line: a name, the Git URL, the branch to follow, the pinned commit, and
-`feed` (a repository of packages) or `package` (a repository that is one
-package). Their packages win over same-named ones in the OpenWrt feeds. List
-the packages you want in a profile. Check a source's licence before publishing
-images built with it.
+### Software from outside OpenWrt
 
-Kernel modules always have to come from this build: the kernel is not an
-official OpenWrt one, so official kmods do not install with `apk`.
+Third-party sources go in `upstream/third-party.conf`, one per line:
+
+```
+# NAME   URL                                     BRANCH  COMMIT     TYPE
+myfeed   https://github.com/<owner>/<repo>.git   main    <commit>   feed
+mytheme  https://github.com/<owner>/<theme>.git  master  <commit>   package
+```
+
+- `feed`: a repository of packages, like an OpenWrt feed.
+- `package`: a repository that is a single package (its `Makefile` at the
+  top), such as most LuCI themes.
+
+Then list the packages you want in a profile. Packages of these sources win
+over same-named ones in the OpenWrt feeds, and the automatic builds move each
+source to the newest commit of its branch (`scripts/bump-upstream.sh`). To
+drop a source, delete its line and its packages from the profiles. Check a
+source's licence before publishing images built with it.
+
+### Your own packages
+
+`feeds/mx4300/` is a feed of this repository's own packages (the firmware
+updater). Add a directory there with an OpenWrt package `Makefile` (and its
+files) and list the package in a profile; `scripts/build.sh` makes the feed
+available to every build.
 
 ## Building
 
