@@ -5,7 +5,8 @@
 			"file": {
 				"/usr/sbin/mx4300-ota status": [ "exec" ],
 				"/usr/sbin/mx4300-ota list": [ "exec" ],
-				"/usr/sbin/mx4300-ota check": [ "exec" ]
+				"/usr/sbin/mx4300-ota check": [ "exec" ],
+				"/usr/sbin/mx4300-ota details *": [ "exec" ]
 			},
 			"uci": [ "mx4300-ota" ]
 		},

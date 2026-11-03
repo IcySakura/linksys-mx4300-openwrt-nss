@@ -124,6 +124,13 @@ of the repository that built its image:
    newest first, marked newer or older than the installed firmware. Each has
    an image for the profile the router was built with (`PROFILE` in
    `/etc/mx4300-nss/build-info`).
+   **What's new** on a release compares it with the firmware running now:
+   the sources that changed (with their commit range on GitHub), the
+   kernel, NSS and profile packages from version to version, the count of
+   all other package changes, and the packages installed by hand that the
+   release would drop. Installing shows the same summary first. Every
+   release's notes on GitHub also say what changed since the release before
+   (built from its `versions-<profile>.json`).
 2. **Install** on any of them - the newest, or an older one to go back to -
    downloads it, verifies the release's `sha256sums` against the `usign` key in
    the image (`/etc/mx4300-nss/release.pub`) and the image against
@@ -136,6 +143,9 @@ of the repository that built its image:
    otherwise the router switches back to the previous partition and reboots.
    A firmware that hangs or keeps rebooting before that is undone by U-Boot
    after three boots.
+
+The page also keeps an **update history** (installs, keeps, rollbacks; in
+`/etc/mx4300-ota/history`, kept across updates) and links to all releases.
 
 Settings (in LuCI, or `/etc/config/mx4300-ota`): release repository, channel,
 trial period, what happens when it ends, health-check host, signing key.

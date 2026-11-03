@@ -86,6 +86,7 @@ if [ -e "$R/usr/sbin/mx4300-ota" ]; then
 	check "mx4300-ota init enabled (S98, before the S99 bootcount reset)" "ls '$R'/etc/rc.d/ | grep -q '^S98mx4300-ota$'"
 	check "LuCI view for mx4300-ota" "[ -e '$R/www/luci-static/resources/view/mx4300-ota.js' ]"
 	check "release key for mx4300-ota" "[ -s '$R/etc/mx4300-nss/release.pub' ]"
+	check "mx4300-ota what's new: details.uc, components.json, history kept" "[ -s '$R/usr/share/mx4300-ota/details.uc' ] && [ -s '$R/etc/mx4300-nss/components.json' ] && grep -q '/etc/mx4300-ota/' '$R/lib/upgrade/keep.d/mx4300-ota'"
 	check "TLS for the updater's downloads (libustream)" "ls '$R'/lib/ '$R'/usr/lib/ 2>/dev/null | grep -q '^libustream-'"
 	grep -q '^OTA_REPO=.' "$R/etc/mx4300-nss/build-info" ||
 		echo "  NOTE no OTA_REPO in build-info: set mx4300-ota.main.repo on the router"

@@ -11,7 +11,7 @@
 # Each profile gets overlays/common (if present) plus any --overlay
 # directories as the image's "files/".
 #
-# Results: $OUT/<profile>/ (images, manifest, config, sha256sums), validated
+# Results: $OUT/<profile>/ (images, manifest, config, versions.json, sha256sums), validated
 # with tools/validate-images.sh.
 #
 # Every image gets configs/base.packages (the OTA updater from feeds/mx4300)
@@ -148,6 +148,10 @@ for PROFILE in "${PROFILES[@]}"; do
 	for o in "${OVERLAYS[@]}"; do cp -a "$o/." files/; done
 	[ ! -s "$TOP/keys/release.pub" ] || cp "$TOP/keys/release.pub" files/etc/mx4300-nss/release.pub
 	cp "$TOP/profiles/$PROFILE.packages" files/etc/mx4300-nss/profile.packages
+	# The sources of this build, for the updater's "what's new"
+	python3 -I "$TOP/scripts/versions.py" components \
+		"https://github.com/${OTA_REPO:-unknown/unknown}" "$(git -C "$TOP" rev-parse HEAD 2>/dev/null || echo unknown)" \
+		--third-party "$TOP/upstream/third-party.conf" > files/etc/mx4300-nss/components.json
 	cat > files/etc/mx4300-nss/build-info <<-EOF
 		PROFILE=$PROFILE
 		RELEASE_TAG=$RELEASE_TAG
@@ -187,6 +191,8 @@ for PROFILE in "${PROFILES[@]}"; do
 	cp "$BIN"/*"$DEV"* "$BIN"/profiles.json "$dest"/
 	cp .config "$dest/config.full"
 	cp files/etc/mx4300-nss/build-info "$dest/build-info"
+	python3 -I "$TOP/scripts/versions.py" versions files/etc/mx4300-nss/components.json \
+		"$BIN"/*"$DEV".manifest "$PROFILE" "$RELEASE_TAG" > "$dest/versions.json"
 	(cd "$dest" && sha256sum -- *"$DEV"* > sha256sums)
 
 	"$TOP/tools/validate-images.sh" "$dest"

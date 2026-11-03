@@ -23,6 +23,8 @@ start_service() {
 		# this, the previous firmware, is running again.
 		mkdir -p /etc/mx4300-ota
 		echo "Update to ${trial% *} was rolled back on $(date)" > /etc/mx4300-ota/last-result
+		printf '%s\trolled-back\t%s\t%s\n' "$(date +%s)" "${trial% *}" \
+			"Update to ${trial% *} did not stick; back on the previous firmware" >> /etc/mx4300-ota/history
 		logger -t mx4300-ota "update to ${trial% *} was rolled back"
 		fw_setenv mx4300_ota_trial
 	fi
