@@ -18,8 +18,9 @@ luci-app-passwall_INCLUDE_Geoview
 -luci-app-passwall_INCLUDE_V2ray_Plugin
 xray-core
 
-# Web UI theme (third-party)
+# Web UI theme (third-party) and its settings page (theme presets, colours, layout)
 luci-theme-aurora
+luci-app-aurora-config
 
 # Cloudflare tunnel, dynamic DNS
 luci-app-cloudflared
