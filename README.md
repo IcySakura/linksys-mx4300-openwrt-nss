@@ -45,8 +45,9 @@ published images from, and adds:
   OpenSSL throughout, and the kernel modules most often wanted (USB storage,
   TUN, WireGuard) built in.
 - **Third-party software** (`upstream/third-party.conf`): sources outside
-  OpenWrt, pinned to a commit like the feeds. The `extended` profile uses
-  Passwall and the Aurora LuCI theme from there.
+  OpenWrt, pinned to a commit like the feeds and following their releases
+  where they publish any. The `extended` profile uses Passwall and the Aurora
+  LuCI theme from there.
 - **Firmware updates** (`feeds/mx4300/`, `patches/0001`): see
   [Firmware updates](#firmware-updates).
 
@@ -257,20 +258,37 @@ committing - it lists everything you run.
 Third-party sources go in `upstream/third-party.conf`, one per line:
 
 ```
-# NAME   URL                                     BRANCH  COMMIT     TYPE
-myfeed   https://github.com/<owner>/<repo>.git   main    <commit>   feed
-mytheme  https://github.com/<owner>/<theme>.git  master  <commit>   package
+# NAME   URL                                     FOLLOW         COMMIT    TYPE     [RELEASE]
+myapp    https://github.com/<owner>/<app>.git    release        <commit>  feed     <tag>
+mypkgs   https://github.com/<owner>/<pkgs>.git   main@myapp     <commit>  feed
+mytheme  https://github.com/<owner>/<theme>.git  master         <commit>  package
 ```
+
+`FOLLOW` says where the automatic builds move the source
+(`scripts/bump-upstream.sh`):
+
+- `release`: its newest GitHub release (pre-releases left out). The tag is
+  kept as `RELEASE` and shown in release notes and on the update page.
+  Prefer this: the authors decided the release is ready, while the newest
+  commit can be work in progress.
+- `BRANCH@SOURCE`: the commit `BRANCH` was at when `SOURCE`'s release was
+  published, for a source without releases that is used together with one
+  that has them (Passwall's packages follow the Passwall release this way:
+  the combination its authors released).
+- `BRANCH`: the newest commit of the branch, for sources that publish no
+  releases.
+
+`TYPE`:
 
 - `feed`: a repository of packages, like an OpenWrt feed.
 - `package`: a repository that is a single package (its `Makefile` at the
   top), such as most LuCI themes.
 
-Then list the packages you want in a profile. Packages of these sources win
-over same-named ones in the OpenWrt feeds, and the automatic builds move each
-source to the newest commit of its branch (`scripts/bump-upstream.sh`). To
-drop a source, delete its line and its packages from the profiles. Check a
-source's licence before publishing images built with it.
+For a new line, put any commit in `COMMIT` (and leave `RELEASE` out): run
+`scripts/bump-upstream.sh` to fill them in. Then list the packages you want
+in a profile. Packages of these sources win over same-named ones in the
+OpenWrt feeds. To drop a source, delete its line and its packages from the
+profiles. Check a source's licence before publishing images built with it.
 
 ### Your own packages
 
@@ -295,8 +313,8 @@ release:
 **Automatic builds.** Every day the workflow runs `scripts/bump-upstream.sh`:
 it moves the tree to the newest upstream builder release (`ppe-nss-*`, which
 names the tree and NSS commits it was built from), each feed to the commit it
-was at when that release was built, and each third-party source to the head of
-its branch. If anything moved, it builds and validates both profiles,
+was at when that release was built, and each third-party source to its newest
+release (or as its `FOLLOW` column says). If anything moved, it builds and validates both profiles,
 publishes them on the **testing** channel and commits the new pins. If a build
 fails, nothing is published and the failed run notifies you. Nothing is ever
 installed automatically: routers only update when you choose a release.

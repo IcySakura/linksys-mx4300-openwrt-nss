@@ -191,7 +191,7 @@ jobs:
             echo
             echo "- Channel: **$PUBLISH**"
             echo "- Upstream: [\`${OPENWRT_COMMIT::12}\`](https://github.com/$repo/commit/$OPENWRT_COMMIT), as in [\`$OPENWRT_RELEASE\`](https://github.com/$RELEASES_REPO/releases/tag/$OPENWRT_RELEASE)"
-            echo "- Third-party: $(sed -e 's/#.*//' upstream/third-party.conf | awk 'NF { printf "%s\`%s@%.7s\`", sep, $1, $4; sep = ", " }')"
+            echo "- Third-party: $(sed -e 's/#.*//' upstream/third-party.conf | awk 'NF { printf "%s\`%s@%s\`", sep, $1, NF >= 6 ? $6 : substr($4, 1, 7); sep = ", " }')"
             echo "- Profiles: $PROFILES (see \`profiles/\`)"
             echo
             # What changed since the newest earlier release (its versions-<profile>.json)

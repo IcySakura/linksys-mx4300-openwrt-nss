@@ -94,7 +94,7 @@ mkdir -p "$DL_DIR"
 # Single-package repositories, checked out into one local feed
 rm -rf "$EXTRA.new"
 mkdir -p "$EXTRA.new"
-echo "$THIRD_PARTY" | while read -r name url branch commit type; do
+echo "$THIRD_PARTY" | while read -r name url follow commit type release; do
 	[ "$type" = package ] || continue
 	if [ ! -d "$EXTRA/$name/.git" ]; then
 		git init -q "$EXTRA.new/$name"

@@ -9,7 +9,9 @@
 #   - upstream/openwrt.conf gets its tree commit,
 #   - upstream/feeds.conf gets its nss commit, and every other feed the commit
 #     its branch was at when the release was built,
-#   - upstream/third-party.conf gets the head of each source's branch.
+#   - upstream/third-party.conf moves each source as its FOLLOW column says
+#     (a release, the commit current when a release was published, or the
+#     head of a branch).
 #
 # Prints what changed; exits 0 with no change when everything is current.
 # In GitHub Actions it also sets the outputs "changed" and "summary".
@@ -34,6 +36,15 @@ gh_repo() {
 # Commit of branch $2 of GitHub repository $1 at time $3 (now if empty)
 branch_commit() {
 	api "repos/$1/commits?sha=$2&per_page=1${3:+&until=$3}" | json 'd[0]["sha"]'
+}
+# Newest release of GitHub repository $1 (drafts and pre-releases left out):
+# "TAG PUBLISHED_AT"
+latest_release() {
+	api "repos/$1/releases/latest" | json 'd["tag_name"] + " " + d["published_at"]'
+}
+# Commit of tag (or any ref) $2 of GitHub repository $1
+ref_commit() {
+	api "repos/$1/commits/$2" | json 'd["sha"]'
 }
 
 release=${1:-}
@@ -85,15 +96,51 @@ while read -r kind name url; do
 	sed -i "s#^src-git $name ${url%^*}^[0-9a-f]*\$#src-git $name ${url%^*}^$new#" "$FEEDS"
 done < <(grep '^src-git ' "$FEEDS")
 
-# Third-party sources: NAME URL BRANCH COMMIT TYPE -> branch head
-while read -r name url branch old type; do
-	repo=$(gh_repo "$url")
-	[ -n "$repo" ] || { echo "$name: not on GitHub, left alone" >&2; continue; }
-	new=$(branch_commit "$repo" "$branch")
-	[ "$new" = "$old" ] && continue
-	sed -i "s#^$name $url $branch $old #$name $url $branch $new #" "$THIRD"
-	changes+=("$name ${old:0:7}..${new:0:7}")
-done < <(sed -e 's/#.*//' "$THIRD" | awk 'NF == 5')
+# Third-party sources: NAME URL FOLLOW COMMIT TYPE [RELEASE]. Sources that
+# follow a release go first, so BRANCH@SOURCE knows when SOURCE's was published.
+declare -A published
+set_source() {	# NAME COMMIT [RELEASE]
+	awk -v n="$1" -v c="$2" -v r="${3:-}" '
+		!/^[[:space:]]*#/ && NF >= 5 && $1 == n { print $1, $2, $3, c, $5 (r != "" ? " " r : ""); next }
+		{ print }' "$THIRD" > "$THIRD.new"
+	mv "$THIRD.new" "$THIRD"
+}
+for pass in releases others; do
+	while read -r name url follow old type old_tag; do
+		case "$pass:$follow" in
+		releases:release|others:*@*) ;;
+		others:release|releases:*@*) continue ;;
+		releases:*) continue ;;
+		esac
+		repo=$(gh_repo "$url")
+		[ -n "$repo" ] || { echo "$name: not on GitHub, left alone" >&2; continue; }
+		tag=
+		case "$follow" in
+		release)
+			read -r tag when < <(latest_release "$repo" || true)
+			[ -n "$tag" ] || { echo "$name: no release, left alone" >&2; continue; }
+			published[$name]=$when
+			new=$(ref_commit "$repo" "$tag")
+			;;
+		*@*)
+			ref=${follow#*@}
+			[ -n "${published[$ref]:-}" ] ||
+				{ echo "$name: $ref does not follow a release, left alone" >&2; continue; }
+			new=$(branch_commit "$repo" "${follow%@*}" "${published[$ref]}")
+			;;
+		*)
+			new=$(branch_commit "$repo" "$follow")
+			;;
+		esac
+		[ "$new" = "$old" ] && [ "$tag" = "${old_tag:-}" ] && continue
+		set_source "$name" "$new" "$tag"
+		if [ -n "$tag" ]; then
+			changes+=("$name ${old_tag:-${old:0:7}}..$tag")
+		else
+			changes+=("$name ${old:0:7}..${new:0:7}")
+		fi
+	done < <(sed -e 's/#.*//' "$THIRD" | awk 'NF >= 5')
+done
 
 if [ "$old_conf" != "$(cat "$CONF")" ]; then
 	changes=("$release" "${changes[@]}")
