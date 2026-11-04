@@ -18,9 +18,13 @@ luci-app-passwall_INCLUDE_Geoview
 -luci-app-passwall_INCLUDE_V2ray_Plugin
 xray-core
 
-# Web UI theme (third-party) and its settings page (theme presets, colours, layout)
-luci-theme-aurora
-luci-app-aurora-config
+# UPnP IGD and NAT-PMP port forwarding for games and apps (Services -> UPnP
+# IGD & PCP); off until enabled there
+luci-app-upnp
+
+# Root shell in the browser (Services -> Terminal), on the LAN, behind the
+# root password
+luci-app-ttyd
 
 # Cloudflare tunnel, dynamic DNS
 luci-app-cloudflared

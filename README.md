@@ -46,8 +46,7 @@ published images from, and adds:
   TUN, WireGuard) built in.
 - **Third-party software** (`upstream/third-party.conf`): sources outside
   OpenWrt, pinned to a commit like the feeds and following their releases
-  where they publish any. The `extended` profile uses Passwall and the Aurora
-  LuCI theme from there.
+  where they publish any. The `extended` profile uses Passwall from there.
 - **Firmware updates** (`feeds/mx4300/`, `patches/0001`): see
   [Firmware updates](#firmware-updates).
 
@@ -195,7 +194,7 @@ Every image is built from three layers:
 | Layer | File | Contents |
 |---|---|---|
 | Base | `configs/mx4300-nss.config` | OpenWrt with LuCI over HTTPS, PPE flow offload, NSS Wi-Fi offload (`kmod-nss-wifi-drv`, NSS firmware 12.5), SQM with the PPE shaper (`sqm-scripts`, `luci-app-sqm`, `luci-app-qca-ppe-qos`), OpenSSL (`apk-openssl`, `wpad-openssl`), `kmod-tun`, `kmod-wireguard`, USB storage, `ppe-help`, crash logs (`kmod-ramoops`) |
-| Every profile | `configs/base.packages` | `mx4300-ota`, `luci-app-mx4300-ota` (the [firmware updater](#firmware-updates)), `luci-theme-footstrap` (the default LuCI theme: a new install, or a router still on Bootstrap, switches to it once, even when another theme in the image makes itself the default on install; a theme you chose stays) |
+| Every profile | `configs/base.packages` | `mx4300-ota`, `luci-app-mx4300-ota` (the [firmware updater](#firmware-updates)), `luci-mod-dashboard` (LuCI's Dashboard status page, its landing page), `luci-theme-footstrap` (the default LuCI theme: a new install, or a router still on Bootstrap, switches to it once, even when another theme in the image makes itself the default on install; a theme you chose stays) |
 | One profile | `profiles/<name>.packages` | what that profile adds or leaves out |
 
 The profiles in this repository:
@@ -203,7 +202,7 @@ The profiles in this repository:
 | Profile | Adds |
 |---|---|
 | `default` | nothing |
-| `extended` | Proxy: `luci-app-passwall` with `xray-core`, V2Ray geodata and `geoview` (its other cores - sing-box, HAProxy, SmartDNS, Shadowsocks, SSR, simple-obfs, v2ray-plugin - left out). Theme: `luci-theme-aurora` with its settings page `luci-app-aurora-config` (available; Footstrap, in every image, stays the default. Pick one in *System → System → Language and Style*). Tunnels and VPN: `luci-app-cloudflared`, `luci-app-ocserv`, `luci-proto-openconnect`, `openconnect`. Dynamic DNS: `luci-app-ddns`, `ddns-scripts-cloudflare`. Client steering between bands and access points: `luci-app-usteer`. Statistics: `luci-app-statistics` with the cpu, interface, iwinfo, load, memory, network and rrdtool plugins. mDNS: `avahi-daemon-service-http`, `dbus-utils`. USB phone tethering: `usbmuxd`, `kmod-usb-net-ipheth`, `kmod-usb-net-rndis`, `kmod-usb-net-cdc-ether`, `kmod-usb-net-cdc-eem`, `kmod-usb-net-cdc-subset`, `kmod-usb3`, `kmod-usb-dwc3-qcom`. TCP BBR: `kmod-tcp-bbr`. Tools: `bind-host`, `curl`, `e2fsprogs`, `htop`, `iperf3`, `jq`, `losetup`, `openssl-util`, `speedtestcpp`, `tcpdump`, `unzip`, `usbutils` |
+| `extended` | Proxy: `luci-app-passwall` with `xray-core`, V2Ray geodata and `geoview` (its other cores - sing-box, HAProxy, SmartDNS, Shadowsocks, SSR, simple-obfs, v2ray-plugin - left out). Port forwarding for games and apps: `luci-app-upnp` (UPnP IGD and NAT-PMP, off until enabled in *Services → UPnP IGD & PCP*). Terminal in the browser: `luci-app-ttyd` (*Services → Terminal*, LAN only, root password). Tunnels and VPN: `luci-app-cloudflared`, `luci-app-ocserv`, `luci-proto-openconnect`, `openconnect`. Dynamic DNS: `luci-app-ddns`, `ddns-scripts-cloudflare`. Client steering between bands and access points: `luci-app-usteer`. Statistics: `luci-app-statistics` with the cpu, interface, iwinfo, load, memory, network and rrdtool plugins. mDNS: `avahi-daemon-service-http`, `dbus-utils`. USB phone tethering: `usbmuxd`, `kmod-usb-net-ipheth`, `kmod-usb-net-rndis`, `kmod-usb-net-cdc-ether`, `kmod-usb-net-cdc-eem`, `kmod-usb-net-cdc-subset`, `kmod-usb3`, `kmod-usb-dwc3-qcom`. TCP BBR: `kmod-tcp-bbr`. Tools: `bind-host`, `curl`, `e2fsprogs`, `htop`, `iperf3`, `jq`, `losetup`, `openssl-util`, `speedtestcpp`, `tcpdump`, `unzip`, `usbutils` |
 
 The complete package list of an image is in its release as
 `*-<profile>.manifest`, and on a running router in `apk list --installed`.
@@ -223,7 +222,7 @@ a package, build it into your images:
 
    ```
    # add a package
-   luci-app-upnp
+   luci-app-nlbwmon
    # leave out a package the base or another layer includes
    -luci-app-sqm
    ```
@@ -406,9 +405,8 @@ keys/release.pub           public key the releases are signed with (also in the 
   (`patches/feeds/packages/`) taken from the builder.
 - **[qosmio/openwrt-ipq](https://github.com/qosmio/openwrt-ipq)** - the NSS
   packaging the above builds on.
-- **[Openwrt-Passwall](https://github.com/Openwrt-Passwall)** and
-  **[eamonxg/luci-theme-aurora](https://github.com/eamonxg/luci-theme-aurora)** -
-  the third-party software of the `extended` profile.
+- **[Openwrt-Passwall](https://github.com/Openwrt-Passwall)** - the
+  third-party software of the `extended` profile.
 - **Qualcomm** - the NSS and ath11k firmware (fetched by the build), under
   their own licences.
 
