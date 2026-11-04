@@ -117,8 +117,9 @@ for pass in releases others; do
 		tag=
 		case "$follow" in
 		release)
-			read -r tag when < <(latest_release "$repo" || true)
-			[ -n "$tag" ] || { echo "$name: no release, left alone" >&2; continue; }
+			rel=$(latest_release "$repo") ||
+				{ echo "$name: cannot look up the newest release of $repo" >&2; exit 1; }
+			read -r tag when <<< "$rel"
 			published[$name]=$when
 			new=$(ref_commit "$repo" "$tag")
 			;;
