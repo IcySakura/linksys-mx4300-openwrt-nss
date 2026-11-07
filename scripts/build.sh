@@ -130,11 +130,14 @@ for p in "$TOP"/patches/feeds/*/*.patch; do
 done
 rm -rf tmp/info
 
-./scripts/feeds install -a
-# Third-party packages win over same-named ones in the OpenWrt feeds
+# Third-party packages win over same-named ones in the OpenWrt feeds. The
+# feeds script never replaces a package already installed from another feed,
+# so start from nothing and install the third-party feeds first.
+./scripts/feeds uninstall -a >/dev/null
 for feed in $(echo "$THIRD_PARTY" | awk '$5 == "feed" { print $1 }') extra; do
 	./scripts/feeds install -a -f -p "$feed"
 done
+./scripts/feeds install -a
 
 # --- One image per profile ------------------------------------------------------
 BIN=bin/targets/qualcommax/ipq807x
