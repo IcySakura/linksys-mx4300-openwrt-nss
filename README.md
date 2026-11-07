@@ -17,8 +17,9 @@ published images from, and adds:
   software from feeds outside OpenWrt across upgrades.
 - **Signed A/B firmware updates in LuCI** (*System → Firmware Update*), with a
   trial boot and automatic rollback to the previous firmware.
-- **Automatic builds**: GitHub Actions rebuilds when upstream publishes a new
-  build or a third-party source moves, and publishes it as a testing release.
+- **Automatic builds**: GitHub Actions rebuilds, at most once a day, when
+  upstream publishes a new build, a third-party source moves or this repository
+  has new commits, and publishes it as a testing release.
 
 > [!WARNING]
 > Experimental firmware for **the MX4300 only**. It is a snapshot (OpenWrt
@@ -100,7 +101,7 @@ replaces the whole system image. Put everything you want to keep into a
 profile, so the image you upgrade to already contains it. The image records
 its build in `/etc/mx4300-nss/build-info`.
 
-- **In LuCI:** *System → Firmware Update* → *Show releases* → *Install*.
+- **In LuCI:** *System → Firmware Update* → *Install*.
 - **On the command line:** `mx4300-ota check`, then `mx4300-ota upgrade`.
 - **By hand**, e.g. with an image built without the updater: flash the
   `*-<profile>-squashfs-sysupgrade.bin` of the profile you run in LuCI or
@@ -120,8 +121,8 @@ The images include `mx4300-ota` (command line) and `luci-app-mx4300-ota`
 (*System → Firmware Update*). They update the router from the GitHub releases
 of the repository that built its image:
 
-1. **Show releases** lists the releases on the router's channel (below),
-   newest first, marked newer or older than the installed firmware. Each has
+1. The page lists the releases on the router's channel (below) when it
+   opens, newest first (the five newest, the rest on demand), marked newer or older than the installed firmware. Each has
    an image for the profile the router was built with (`PROFILE` in
    `/etc/mx4300-nss/build-info`).
    **What's new** on a release compares it with the firmware running now:
@@ -313,8 +314,11 @@ release:
 it moves the tree to the newest upstream builder release (`ppe-nss-*`, which
 names the tree and NSS commits it was built from), each feed to the commit it
 was at when that release was built, and each third-party source to its newest
-release (or as its `FOLLOW` column says). If anything moved, it builds and validates both profiles,
-publishes them on the **testing** channel and commits the new pins. If a build
+release (or as its `FOLLOW` column says). If anything moved, or this
+repository has commits since the newest release (other than the workflow's own
+pin commits), it builds and validates both profiles, publishes them on the
+**testing** channel and commits the new pins. So there is at most one
+automatic build a day, and none on days when nothing changed. If a build
 fails, nothing is published and the failed run notifies you. Nothing is ever
 installed automatically: routers only update when you choose a release.
 (GitHub pauses scheduled workflows in repositories without activity for 60
