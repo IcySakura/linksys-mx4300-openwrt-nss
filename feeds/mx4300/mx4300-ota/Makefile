@@ -13,7 +13,7 @@ define Package/mx4300-ota
   CATEGORY:=Utilities
   TITLE:=Signed A/B firmware updates from GitHub releases (Linksys MX4300)
   DEPENDS:=@TARGET_qualcommax_ipq807x_DEVICE_linksys_mx4300 \
-	+uclient-fetch +ca-bundle +usign +jsonfilter +ucode +ucode-mod-fs
+	+curl +ca-bundle +usign +jsonfilter +ucode +ucode-mod-fs
   PKGARCH:=all
 endef
 
