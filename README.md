@@ -203,7 +203,7 @@ Every image is built from three layers:
 | Layer | File | Contents |
 |---|---|---|
 | Base | `configs/mx4300-nss.config` | OpenWrt with LuCI over HTTPS, PPE flow offload, NSS Wi-Fi offload (`kmod-nss-wifi-drv`, NSS firmware 12.5), SQM with the PPE shaper (`sqm-scripts`, `luci-app-sqm`, `luci-app-qca-ppe-qos`), OpenSSL (`apk-openssl`, `wpad-openssl`), `kmod-tun`, `kmod-wireguard`, USB storage, `ppe-help`, crash logs (`kmod-ramoops`) |
-| Every profile | `configs/base.packages` | `mx4300-ota`, `luci-app-mx4300-ota` (the [firmware updater](#firmware-updates)), `luci-mod-dashboard` (LuCI's Dashboard status page, its landing page), `luci-app-mx4300-thermal` (temperatures of the CPU, NSS cores and Wi-Fi radios: a Dashboard card and tab, and a section on *Status → Overview*), `luci-theme-footstrap` (the default LuCI theme: a new install, or a router still on Bootstrap, switches to it once, even when another theme in the image makes itself the default on install; a theme you chose stays) |
+| Every profile | `configs/base.packages` | `mx4300-ota`, `luci-app-mx4300-ota` (the [firmware updater](#firmware-updates)), `luci-mod-dashboard` (LuCI's Dashboard status page, its landing page), `luci-theme-footstrap` (the default LuCI theme: a new install, or a router still on Bootstrap, switches to it once, even when another theme in the image makes itself the default on install; a theme you chose stays) |
 | One profile | `profiles/<name>.packages` | what that profile adds or leaves out |
 
 The profiles in this repository:
@@ -408,8 +408,7 @@ configs/mx4300-nss.config  base build configuration (diffconfig)
 overlays/common/           files in every image (default theme switch)
 configs/base.packages      packages in every profile (the firmware updater)
 profiles/                  package profiles (*.packages)
-feeds/mx4300/              this repository's packages: mx4300-ota, luci-app-mx4300-ota,
-                           luci-app-mx4300-thermal
+feeds/mx4300/              this repository's packages: mx4300-ota, luci-app-mx4300-ota
 scripts/build.sh           reproducible build of one or more profiles
 scripts/bump-upstream.sh   move upstream/ forward
 scripts/profile.sh         profile -> .config, and the post-defconfig check
