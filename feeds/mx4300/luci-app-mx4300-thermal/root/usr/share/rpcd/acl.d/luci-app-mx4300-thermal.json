@@ -1,0 +1,10 @@
+{
+	"luci-app-mx4300-thermal": {
+		"description": "Grant access to temperature readings",
+		"read": {
+			"ubus": {
+				"luci.thermal": [ "get" ]
+			}
+		}
+	}
+}

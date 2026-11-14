@@ -203,7 +203,7 @@ Every image is built from three layers:
 | Layer | File | Contents |
 |---|---|---|
 | Base | `configs/mx4300-nss.config` | OpenWrt with LuCI over HTTPS, PPE flow offload, NSS Wi-Fi offload (`kmod-nss-wifi-drv`, NSS firmware 12.5), SQM with the PPE shaper (`sqm-scripts`, `luci-app-sqm`, `luci-app-qca-ppe-qos`), OpenSSL (`apk-openssl`, `wpad-openssl`), `kmod-tun`, `kmod-wireguard`, USB storage, `ppe-help`, crash logs (`kmod-ramoops`) |
-| Every profile | `configs/base.packages` | `mx4300-ota`, `luci-app-mx4300-ota` (the [firmware updater](#firmware-updates)), `luci-mod-dashboard` (LuCI's Dashboard status page, its landing page), `luci-theme-footstrap` (the default LuCI theme: a new install, or a router still on Bootstrap, switches to it once, even when another theme in the image makes itself the default on install; a theme you chose stays) |
+| Every profile | `configs/base.packages` | `mx4300-ota`, `luci-app-mx4300-ota` (the [firmware updater](#firmware-updates)), `luci-mod-dashboard` (LuCI's Dashboard status page, its landing page), `luci-app-mx4300-thermal` (temperatures of the CPU, NSS cores and Wi-Fi radios: a Dashboard card and tab, and a section on *Status → Overview*), `luci-theme-footstrap` (the default LuCI theme: a new install, or a router still on Bootstrap, switches to it once, even when another theme in the image makes itself the default on install; a theme you chose stays) |
 | One profile | `profiles/<name>.packages` | what that profile adds or leaves out |
 
 The profiles in this repository:
@@ -211,7 +211,7 @@ The profiles in this repository:
 | Profile | Adds |
 |---|---|
 | `default` | nothing |
-| `extended` | Proxy: `luci-app-passwall` with `xray-core`, V2Ray geodata and `geoview` (its other cores - sing-box, HAProxy, SmartDNS, Shadowsocks, SSR, simple-obfs, v2ray-plugin - left out). Port forwarding for games and apps: `luci-app-upnp` (UPnP IGD and NAT-PMP, off until enabled in *Services → UPnP IGD & PCP*). Terminal in the browser: `luci-app-ttyd` (*Services → Terminal*, LAN only, root password). Tunnels and VPN: `luci-app-cloudflared`, `luci-app-ocserv`, `luci-proto-openconnect`, `openconnect`. Dynamic DNS: `luci-app-ddns`, `ddns-scripts-cloudflare`. Client steering between bands and access points: `luci-app-usteer`. Statistics: `luci-app-statistics` with the cpu, interface, iwinfo, load, memory, network and rrdtool plugins. mDNS: `avahi-daemon-service-http`, `dbus-utils`. USB phone tethering: `usbmuxd`, `kmod-usb-net-ipheth`, `kmod-usb-net-rndis`, `kmod-usb-net-cdc-ether`, `kmod-usb-net-cdc-eem`, `kmod-usb-net-cdc-subset`, `kmod-usb3`, `kmod-usb-dwc3-qcom`. TCP BBR: `kmod-tcp-bbr`. Tools: `bind-host`, `curl`, `e2fsprogs`, `htop`, `iperf3`, `jq`, `losetup`, `openssl-util`, `speedtestcpp`, `tcpdump`, `unzip`, `usbutils` |
+| `extended` | Proxy: `luci-app-passwall` with `xray-core`, V2Ray geodata and `geoview` (its other cores - sing-box, HAProxy, SmartDNS, Shadowsocks, SSR, simple-obfs, v2ray-plugin - left out). Port forwarding for games and apps: `luci-app-upnp` (UPnP IGD and NAT-PMP, off until enabled in *Services → UPnP IGD & PCP*). Terminal in the browser: `luci-app-ttyd` (*Services → Terminal*, root password; it works only when LuCI is opened over plain HTTP on the LAN, e.g. `http://192.168.1.1`, because the page embeds `http://<same host>:7681`). Tunnels and VPN: `luci-app-cloudflared`, `luci-app-ocserv`, `luci-proto-openconnect`, `openconnect`. Dynamic DNS: `luci-app-ddns`, `ddns-scripts-cloudflare`. Client steering between bands and access points: `luci-app-usteer`. Statistics: `luci-app-statistics` with the cpu, interface, iwinfo, load, memory, network and rrdtool plugins. mDNS: `avahi-daemon-service-http`, `dbus-utils`. USB phone tethering: `usbmuxd`, `kmod-usb-net-ipheth`, `kmod-usb-net-rndis`, `kmod-usb-net-cdc-ether`, `kmod-usb-net-cdc-eem`, `kmod-usb-net-cdc-subset`, `kmod-usb3`, `kmod-usb-dwc3-qcom`. TCP BBR: `kmod-tcp-bbr`. Tools: `bind-host`, `curl`, `e2fsprogs`, `htop`, `iperf3`, `jq`, `losetup`, `openssl-util`, `speedtestcpp`, `tcpdump`, `unzip`, `usbutils` |
 
 The complete package list of an image is in its release as
 `*-<profile>.manifest`, and on a running router in `apk list --installed`.
@@ -408,7 +408,8 @@ configs/mx4300-nss.config  base build configuration (diffconfig)
 overlays/common/           files in every image (default theme switch)
 configs/base.packages      packages in every profile (the firmware updater)
 profiles/                  package profiles (*.packages)
-feeds/mx4300/              this repository's packages: mx4300-ota, luci-app-mx4300-ota
+feeds/mx4300/              this repository's packages: mx4300-ota, luci-app-mx4300-ota,
+                           luci-app-mx4300-thermal
 scripts/build.sh           reproducible build of one or more profiles
 scripts/bump-upstream.sh   move upstream/ forward
 scripts/profile.sh         profile -> .config, and the post-defconfig check

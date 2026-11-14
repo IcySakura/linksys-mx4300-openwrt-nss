@@ -17,3 +17,8 @@ luci-theme-footstrap
 # Wi-Fi clients), LuCI's landing page. To build without it:
 # "-luci-mod-dashboard" in your profile.
 luci-mod-dashboard
+
+# Temperatures (CPU, NSS cores, Wi-Fi blocks and radios) as a Dashboard card
+# and tab, and a section on Status -> Overview (feeds/mx4300/). To build
+# without it: "-luci-app-mx4300-thermal" in your profile.
+luci-app-mx4300-thermal
