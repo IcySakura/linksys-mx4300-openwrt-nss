@@ -241,6 +241,25 @@ computation and a 128 MB memory pattern test; 16 mV steps.
 | 1593.6 MHz | ≤ 712 mV | not reached | 816 mV |
 | 1497.6 MHz | ≤ 712 mV | not reached | 816 mV |
 
+**Voltage tuning** on the same router (*Lower voltages automatically*, with
+the speed limited to 2400 MHz and the family voltage limit): how far below the
+voltage controller's own choice each level stayed stable, 60 s per 16 mV step:
+
+| Level | Speed tested | Lowest offset that passed | First failure | Margin left by CPR |
+|---|---|---|---|---|
+| 1 | 1017.6 MHz | −64 mV | −80 mV: errors | ~64 mV |
+| 2 | 1382.4 MHz | −144 mV | −160 mV: errors | ~144 mV |
+| 3 | 1651.2 MHz | −144 mV | −160 mV: crash | ~144 mV |
+| 4 | 1843.2 MHz | −128 mV | −144 mV: crash | ~128 mV |
+| 5 | 1920 MHz | −128 mV | −144 mV: crash | ~128 mV |
+| 6 | 2400 MHz | −48 mV | −64 mV: errors | ~48 mV |
+
+That router now runs up to 2400 MHz with each level at its lowest passing
+offset plus 64 mV, never above stock (0 / −80 / −80 / −64 / −64 / 0 mV), and
+passed a 30-minute stability test that way (peak 71.6 °C). Level 6 has the
+least margin: 2400 MHz is close to what this chip does at the family's normal
+voltage.
+
 **Soak:** 15 minutes at 2208 MHz with all four cores under the stress test,
 Passwall proxy downloads and a UDP flood into the router: no errors in 64 GB
 of memory checks and 230,000 checked computations; peak 76 °C.
