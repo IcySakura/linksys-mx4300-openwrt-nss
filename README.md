@@ -52,9 +52,13 @@ published images from, and adds:
   [Firmware updates](#firmware-updates).
 - **CPU overclocking, off by default** (`patches/0002`, `feeds/mx4300/`): the
   IPQ8174's own CPU PLL stops at 1401.6 MHz, but its cores run at up to
-  2208 MHz (+60 %) when fed from the SoC's GPLL2. *System → CPU Overclock*
-  in LuCI turns it on, with a stability test and automatic shut-off after a
-  crash. See [docs/cpu-overclock.md](docs/cpu-overclock.md) for the findings,
+  2208 MHz (+60 %) when fed from the SoC's GPLL2, and further as an *extreme*
+  option (up to 2688 MHz on the router it was tested on, with a raised
+  voltage). *System → CPU Overclock* in LuCI has a simple mode (presets,
+  automatic voltages) and an advanced mode (any speed, per-level voltage
+  offsets, automatic tuning of speed and voltage), a speed/voltage chart, a
+  stability test, and a return to the last tested settings after a crash. See
+  [docs/cpu-overclock.md](docs/cpu-overclock.md) for the findings,
   measurements and risks.
 
 ## How booting works
@@ -408,7 +412,8 @@ on the Windows directories WSL adds.
 upstream/openwrt.conf      pinned upstream tree (URL, commit, upstream builder release)
 upstream/feeds.conf        pinned feeds and the branches they follow
 upstream/third-party.conf  third-party sources (feeds and single packages)
-patches/                   changes to the upstream tree (boot counter hold)
+patches/                   changes to the upstream tree (0001: boot counter hold;
+                           0002: CPU overclocking kernel and device tree changes)
 patches/feeds/FEED/        changes to a feed (sqm-scripts with the PPE shaper)
 configs/mx4300-nss.config  base build configuration (diffconfig)
 overlays/common/           files in every image (default theme switch)

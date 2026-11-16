@@ -1,18 +1,21 @@
 #!/bin/sh
 # mx4300-cpu-oc - CPU overclocking for the Linksys MX4300. Off by default.
 #
-#   mx4300-cpu-oc status            JSON: settings, speeds, temperature, test
-#   mx4300-cpu-oc apply             apply /etc/config/mx4300-cpu-oc now
-#   mx4300-cpu-oc test [SECS] [KHZ] stability test (default 300 s at the
-#                                   configured maximum), detached
-#   mx4300-cpu-oc crash-check       run at boot: turn overclocking off if the
-#                                   previous boot ended in a crash
+#   mx4300-cpu-oc status             JSON: settings, speeds, voltages, test, tuning
+#   mx4300-cpu-oc apply              apply /etc/config/mx4300-cpu-oc now
+#   mx4300-cpu-oc test [SECS] [KHZ]  stability test (default 300 s at the
+#                                    effective maximum), detached
+#   mx4300-cpu-oc tune speed         find the highest stable speed, detached
+#   mx4300-cpu-oc tune voltage       lower each voltage level as far as is
+#                                    stable, plus a margin, detached
+#   mx4300-cpu-oc tune stop          stop a tuning run
+#   mx4300-cpu-oc crash-check        boot: handle a crash in the previous boot
 #
-# The IPQ8174's own CPU PLL stops at 1401.6 MHz. The firmware's kernel takes
-# faster speeds from the SoC's GPLL2 instead (apss-ipq6018.c); those speeds
-# are cpufreq "boost" operating points, which the kernel leaves unused until
-# /sys/devices/system/cpu/cpufreq/boost is 1. Voltages come from CPR, the
-# SoC's closed-loop voltage controller, exactly as for the stock speeds.
+# The IPQ8174's own CPU PLL stops at 1401.6 MHz; the firmware's kernel takes
+# faster speeds from the SoC's GPLL2. They are cpufreq "boost" operating
+# points, unused until /sys/devices/system/cpu/cpufreq/boost is 1. Voltages
+# come from CPR, the SoC's closed-loop voltage controller; each CPR level
+# ("corner") can be shifted by an offset (debugfs offset_volt).
 
 . /lib/functions.sh
 . /usr/share/libubox/jshn.sh
@@ -20,22 +23,106 @@
 CONFIG=mx4300-cpu-oc
 POLICY=/sys/devices/system/cpu/cpufreq/policy0
 BOOST=/sys/devices/system/cpu/cpufreq/boost
+CPR=/sys/kernel/debug/cpr3-regulator/apc/thread0/apc_corner
 STOCK_MAX=1382400
+FAMILY_MAX=2208000	# above this: "extreme"
 STRESS=/usr/libexec/mx4300-cpu-oc-stress
 WORK=/tmp/mx4300-cpu-oc
 TEST=$WORK/test
+TUNE=/etc/mx4300-cpu-oc.tune	# tuning log; survives a crash
+TUNE_PID=/var/run/mx4300-cpu-oc-tune.pid
 PSTORE=/sys/fs/pstore
+HOT=90000		# a test stops (and fails) above this CPU temperature
+
+# Voltage caps ("volt_cap"): no voltage level may run above
+#   family: 944 mV, the top CPR voltage of this chip family at its stock
+#           2208 MHz: what the 2.2 GHz IPQ8074A versions run every day
+#   chip:   776 mV, the highest CPR ceiling stock firmware ever gives this
+#           IPQ8174 (1382.4 MHz)
+#   none:   only the kernel's 1064 mV hard limit
+CAP_FAMILY=944000
+CAP_CHIP=776000
 
 die() {
 	echo "mx4300-cpu-oc: $*" >&2
 	exit 1
 }
 
+# CPR level (1-6) of a speed, as in the device tree's operating points
+level_of() {
+	case "$1" in
+	1017600) echo 1 ;;
+	1382400) echo 2 ;;
+	1497600|1651200) echo 3 ;;
+	1843200) echo 4 ;;
+	1920000) echo 5 ;;
+	*) echo 6 ;;
+	esac
+}
+
 load() {
+	local i
+
 	config_load $CONFIG
 	config_get_bool ENABLED main enabled 0
-	config_get MAX_FREQ main max_freq 1843200
+	config_get MODE main mode simple
+	config_get PRESET main preset performance
+	config_get MAX_FREQ main max_freq 2208000
+	config_get_bool EXTREME main extreme 0
+	config_get VOLT_CAP main volt_cap family
 	config_get REASON main disabled_reason ""
+	config_get LAST_GOOD main last_good ""
+	for i in 1 2 3 4 5 6; do
+		config_get "OFFSET_$i" main "offset_$i" 0
+	done
+}
+
+# The settings in force: presets in simple mode, no extreme speeds unless
+# allowed, and every offset limited by the voltage cap.
+effective() {
+	local l lim
+
+	case "$VOLT_CAP" in
+	chip) CAP=$CAP_CHIP ;;
+	none) CAP="" ;;
+	*) CAP=$CAP_FAMILY ;;
+	esac
+	if [ "$MODE" = advanced ]; then
+		EFF_MAX=$MAX_FREQ
+		[ "$EXTREME" = 1 ] || [ "$EFF_MAX" -le $FAMILY_MAX ] || EFF_MAX=$FAMILY_MAX
+	else
+		case "$PRESET" in
+		balanced) EFF_MAX=1843200 ;;
+		*) EFF_MAX=2208000 ;;
+		esac
+		OFFSET_1=0 OFFSET_2=0 OFFSET_3=0 OFFSET_4=0 OFFSET_5=0 OFFSET_6=0
+		CAP=$CAP_FAMILY
+	fi
+	[ -n "$CAP" ] || return 0
+	for l in 1 2 3 4 5 6; do
+		lim=$(cap_offset $l)
+		[ -n "$lim" ] || continue
+		eval "[ \$OFFSET_$l -gt $lim ] && OFFSET_$l=$lim"
+	done
+	return 0
+}
+
+# Stock (no offset) CPR ceiling of a level: it comes from this chip's fuses
+stock_ceiling() {	# level
+	local c o
+
+	c=$(get_level $1 ceiling_volt)
+	o=$(get_level $1 offset_volt)
+	[ "$c" != 0 ] && echo $((c - o))
+}
+
+# Highest offset that keeps a level's ceiling within the cap
+cap_offset() {	# level
+	local sc
+
+	[ -n "$CAP" ] || return
+	sc=$(stock_ceiling $1)
+	[ -n "$sc" ] && echo $((CAP - sc))
 }
 
 boost_freqs() {
@@ -44,6 +131,11 @@ boost_freqs() {
 
 stock_freqs() {
 	cat $POLICY/scaling_available_frequencies 2>/dev/null
+}
+
+valid_freq() {
+	case " $(stock_freqs) $(boost_freqs) " in *" $1 "*) return 0 ;; esac
+	return 1
 }
 
 cpu_temp() {
@@ -55,15 +147,41 @@ cpu_temp() {
 	cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null
 }
 
-# A speed is valid if the kernel offers it, stock or boost.
-valid_freq() {
-	case " $(stock_freqs) $(boost_freqs) " in *" $1 "*) return 0 ;; esac
-	return 1
+# CPR level offsets (uV). Non-zero status if the kernel refuses the value
+# (a level outside 592-1064 mV, or a kernel without offset support).
+set_offset() {	# level uv
+	[ -w $CPR/corner/offset_volt ] || { [ "$2" = 0 ]; return; }
+	echo "$1" > $CPR/corner/index &&
+		[ "$(cat $CPR/corner/offset_volt)" = "$2" ] && return 0
+	# as an unsigned 64-bit value: older kernels parse this file unsigned,
+	# and read it back as the same signed offset either way
+	printf '%u' "$2" > $CPR/corner/offset_volt 2>/dev/null
 }
 
-set_limits() {	# max_khz boost(0|1)
-	if [ "$2" = 1 ]; then
+get_level() {	# level field -> value, 0 if unavailable
+	local v
+
+	echo "$1" > $CPR/corner/index 2>/dev/null && v=$(cat $CPR/corner/$2 2>/dev/null)
+	echo "${v:-0}"
+}
+
+set_offsets() {	# o1 .. o6
+	local i=1 o ok=0
+
+	for o in "$@"; do
+		set_offset $i "$o" || ok=1
+		i=$((i + 1))
+	done
+	return $ok
+}
+
+# The limit is written before boost is switched on as well as after: a
+# kernel that raises the limit to the top boost speed when boost comes on
+# then drops it straight back (mx4300 kernels keep it unchanged).
+set_limits() {	# max_khz
+	if [ "$1" -gt $STOCK_MAX ]; then
 		[ -w $BOOST ] || die "this kernel has no boost operating points"
+		echo "$1" > $POLICY/scaling_max_freq
 		echo 1 > $BOOST
 		echo "$1" > $POLICY/scaling_max_freq
 	else
@@ -72,44 +190,123 @@ set_limits() {	# max_khz boost(0|1)
 	fi
 }
 
+# Pin the CPU at one speed (stress tests and tuning)
+pin() {	# khz
+	echo "$1" > $POLICY/scaling_max_freq
+	[ "$1" -gt $STOCK_MAX ] && echo 1 > $BOOST
+	echo "$1" > $POLICY/scaling_max_freq
+	echo "$1" > $POLICY/scaling_min_freq
+	echo "$1" > $POLICY/scaling_max_freq
+}
+
+unpin() {
+	echo 1017600 > $POLICY/scaling_min_freq
+}
+
 cmd_apply() {
 	load
-	if [ "$ENABLED" = 1 ] && [ "$MAX_FREQ" -gt $STOCK_MAX ] 2>/dev/null; then
-		valid_freq "$MAX_FREQ" || die "unsupported speed $MAX_FREQ kHz (have: $(stock_freqs) $(boost_freqs))"
-		set_limits "$MAX_FREQ" 1
-		logger -t mx4300-cpu-oc "overclocking on: up to $MAX_FREQ kHz"
+	effective
+	if [ "$ENABLED" = 1 ]; then
+		valid_freq "$EFF_MAX" || die "unsupported speed $EFF_MAX kHz (have: $(stock_freqs) $(boost_freqs))"
+		set_offsets $OFFSET_1 $OFFSET_2 $OFFSET_3 $OFFSET_4 $OFFSET_5 $OFFSET_6 ||
+			logger -t mx4300-cpu-oc "some voltage offsets were refused (outside 592-1064 mV)"
+		set_limits "$EFF_MAX"
+		logger -t mx4300-cpu-oc "overclocking on: up to $EFF_MAX kHz, offsets $OFFSET_1 $OFFSET_2 $OFFSET_3 $OFFSET_4 $OFFSET_5 $OFFSET_6 uV"
 	else
-		set_limits $STOCK_MAX 0
-		[ "$ENABLED" = 1 ] || logger -t mx4300-cpu-oc "stock CPU speeds (up to $STOCK_MAX kHz)"
+		set_offsets 0 0 0 0 0 0
+		set_limits $STOCK_MAX
 	fi
+}
+
+# "Last good": the settings in force when a stability test last passed at the
+# effective maximum. A crash reverts to them instead of turning everything off.
+snapshot() {
+	echo "mode=$MODE preset=$PRESET max_freq=$MAX_FREQ extreme=$EXTREME volt_cap=$VOLT_CAP offset_1=$OFFSET_1 offset_2=$OFFSET_2 offset_3=$OFFSET_3 offset_4=$OFFSET_4 offset_5=$OFFSET_5 offset_6=$OFFSET_6"
+}
+
+restore_snapshot() {	# snapshot
+	local kv
+
+	for kv in $1; do
+		uci -q set "$CONFIG.main.${kv%%=*}=${kv#*=}"
+	done
 }
 
 disable() {	# reason
 	uci -q set $CONFIG.main.enabled=0
 	uci -q set $CONFIG.main.disabled_reason="$1"
 	uci -q commit $CONFIG
-	set_limits $STOCK_MAX 0
+	cmd_apply
 	logger -t mx4300-cpu-oc "overclocking turned off: $1"
 }
 
-# The previous boot crashed if the kernel left a panic/oops record, or if its
-# console log stops without the kernel's own "reboot:" line (a hang the
-# watchdog reset). A power cut leaves nothing behind and does not count.
+# After a crash: back to the last tested settings if they differ, else off.
+fallback() {	# what happened
+	load
+	if [ -n "$LAST_GOOD" ] && [ "$LAST_GOOD" != "$(snapshot)" ]; then
+		restore_snapshot "$LAST_GOOD"
+		uci -q set $CONFIG.main.disabled_reason="$1 The settings were set back to the last ones that passed a stability test."
+		uci -q commit $CONFIG
+		cmd_apply
+		logger -t mx4300-cpu-oc "$1 Back to the last tested settings."
+	else
+		disable "$1 Overclocking was turned off; consider a lower speed or a higher voltage."
+	fi
+}
+
+prev_boot_crashed() {
+	local last
+
+	grep -q ' /sys/fs/pstore ' /proc/mounts || mount -t pstore pstore $PSTORE 2>/dev/null
+	ls $PSTORE/dmesg-ramoops-* >/dev/null 2>&1 && { CRASH_KIND=panic; return 0; }
+	[ -s $PSTORE/console-ramoops-0 ] || return 1
+	last=$(grep -v '^\s*$' $PSTORE/console-ramoops-0 | tail -n 1)
+	case "$last" in
+	*"reboot: Restarting system"*|*"reboot: Power down"*|*"reboot: System halted"*) return 1 ;;
+	esac
+	CRASH_KIND=hang
+	return 0
+}
+
 cmd_crash_check() {
 	local last
 
 	load
-	[ "$ENABLED" = 1 ] || return 0
-	grep -q ' /sys/fs/pstore ' /proc/mounts || mount -t pstore pstore $PSTORE 2>/dev/null
-	if ls $PSTORE/dmesg-ramoops-* >/dev/null 2>&1; then
-		disable "The router crashed (kernel panic) while overclocked. Overclocking was turned off; consider a lower maximum speed."
-	elif [ -s $PSTORE/console-ramoops-0 ]; then
-		last=$(grep -v '^\s*$' $PSTORE/console-ramoops-0 | tail -n 1)
-		case "$last" in
-		*"reboot: Restarting system"*|*"reboot: Power down"*|*"reboot: System halted"*) ;;
-		*) disable "The router stopped responding and was restarted while overclocked. Overclocking was turned off; consider a lower maximum speed." ;;
-		esac
+	if tune_active; then
+		last=$(tail -n 1 $TUNE)
+		case "$last" in TRY*) tlog "CRASH ${last#TRY }" ;; esac
+		logger -t mx4300-cpu-oc "tuning continues after a reboot"
+		start-stop-daemon -S -b -m -p $TUNE_PID -x /bin/sh -- "$0" tune-run resume
+		return 0
 	fi
+	[ "$ENABLED" = 1 ] || return 0
+	prev_boot_crashed || return 0
+	case "$CRASH_KIND" in
+	panic) fallback "The router crashed (kernel panic) while overclocked." ;;
+	*) fallback "The router stopped responding and was restarted while overclocked." ;;
+	esac
+}
+
+# ---- stress tests ----
+
+# run_stress SECS -> sets ST_ERRORS, ST_TEMP, ST_TEXT; returns 0 when clean
+run_stress() {
+	local t maxt=0 pid
+
+	mkdir -p $WORK
+	$STRESS all 128 4 "$1" > $WORK/stress.log 2>&1 &
+	pid=$!
+	while kill -0 $pid 2>/dev/null; do
+		t=$(cpu_temp)
+		[ "${t:-0}" -gt $maxt ] && maxt=$t
+		[ "${t:-0}" -gt $HOT ] && { kill $pid; echo "ERROR too hot: $t" >> $WORK/stress.log; }
+		sleep 2
+	done
+	wait $pid
+	ST_ERRORS=$(grep -c '^ERROR' $WORK/stress.log)
+	ST_TEMP=$maxt
+	ST_TEXT=$(grep -m1 '^ERROR' $WORK/stress.log || grep '^DONE' $WORK/stress.log | sed 's/^DONE //')
+	[ "$ST_ERRORS" = 0 ] && grep -q '^DONE' $WORK/stress.log
 }
 
 test_get() {
@@ -130,42 +327,32 @@ test_put() {	# state khz secs [errors] [max_temp] [text]
 	[ "$1" = running ] || cp $TEST.json /etc/mx4300-cpu-oc.lasttest 2>/dev/null
 }
 
-# Pin the CPU at KHZ for SECS seconds under a CPU + memory stress load and
-# check every result. Errors turn overclocking off.
 cmd_test_run() {
-	local secs=$1 khz=$2 errors temp t maxt=0 boost_was min_was max_was
+	local secs=$1 khz=$2 boost_was max_was ok=0
 
 	boost_was=$(cat $BOOST 2>/dev/null || echo 0)
-	min_was=$(cat $POLICY/scaling_min_freq)
 	max_was=$(cat $POLICY/scaling_max_freq)
-	[ "$khz" -gt $STOCK_MAX ] && echo 1 > $BOOST
-	echo "$khz" > $POLICY/scaling_max_freq
-	echo "$khz" > $POLICY/scaling_min_freq
+	pin "$khz"
 	logger -t mx4300-cpu-oc "stability test: $secs s at $khz kHz"
 	test_put running "$khz" "$secs"
-
-	$STRESS all 128 4 "$secs" > $TEST.log 2>&1 &
-	while kill -0 $! 2>/dev/null; do
-		t=$(cpu_temp)
-		[ "${t:-0}" -gt $maxt ] && maxt=$t
-		sleep 2
-	done
-	wait $!
-	errors=$(grep -c '^ERROR' $TEST.log)
-
-	echo "$min_was" > $POLICY/scaling_min_freq
+	run_stress "$secs" || ok=1
+	unpin
 	echo "$boost_was" > $BOOST 2>/dev/null
 	echo "$max_was" > $POLICY/scaling_max_freq
-
-	if [ "$errors" = 0 ] && grep -q '^DONE' $TEST.log; then
-		test_put passed "$khz" "$secs" 0 "$maxt" "$(grep '^DONE' $TEST.log | sed 's/^DONE //')"
+	load
+	effective
+	if [ $ok = 0 ]; then
+		test_put passed "$khz" "$secs" 0 "$ST_TEMP" "$ST_TEXT"
+		if [ "$ENABLED" = 1 ] && [ "$khz" = "$EFF_MAX" ]; then
+			uci -q set $CONFIG.main.last_good="$(snapshot)"
+			uci -q commit $CONFIG
+		fi
 		logger -t mx4300-cpu-oc "stability test passed at $khz kHz"
 	else
-		test_put failed "$khz" "$secs" "$errors" "$maxt" "$(grep -m1 '^ERROR' $TEST.log)"
-		load
-		[ "$ENABLED" = 1 ] && [ "$MAX_FREQ" -ge "$khz" ] &&
-			disable "The stability test at $((khz / 1000)) MHz found $errors calculation errors. Overclocking was turned off; choose a lower maximum speed."
-		logger -t mx4300-cpu-oc "stability test FAILED at $khz kHz ($errors errors)"
+		test_put failed "$khz" "$secs" "$ST_ERRORS" "$ST_TEMP" "$ST_TEXT"
+		[ "$ENABLED" = 1 ] && [ "$EFF_MAX" -ge "$khz" ] &&
+			fallback "The stability test at $((khz / 1000)) MHz found $ST_ERRORS errors."
+		logger -t mx4300-cpu-oc "stability test FAILED at $khz kHz ($ST_ERRORS errors)"
 	fi
 }
 
@@ -173,11 +360,13 @@ cmd_test() {
 	local secs=${1:-300} khz=$2
 
 	load
-	[ -n "$khz" ] || khz=$MAX_FREQ
+	effective
+	[ -n "$khz" ] || khz=$EFF_MAX
 	case "$secs" in *[!0-9]*|'') die "bad duration: $secs" ;; esac
 	[ "$secs" -ge 10 ] && [ "$secs" -le 3600 ] || die "duration must be 10-3600 s"
 	valid_freq "$khz" || die "unsupported speed $khz kHz"
 	[ "$(test_get | jsonfilter -e '@.state')" = running ] && die "a test is already running"
+	tune_active && die "a tuning run is in progress"
 	mkdir -p $WORK
 	rm -f $WORK/test.pid
 	start-stop-daemon -S -b -m -p $WORK/test.pid -x /bin/sh -- "$0" test-run "$secs" "$khz" ||
@@ -185,30 +374,304 @@ cmd_test() {
 	echo "started"
 }
 
-cmd_status() {
-	local f last s
+# ---- tuning ----
+#
+# The log ($TUNE) is the state: "JOB kind ...", then "TRY key" before every
+# test (synced), "PASS/FAIL/CRASH key" after it, "LEVEL"/"RESULT" lines and
+# "DONE" or "STOPPED" at the end. A TRY without an outcome after a reboot is
+# a crash: crash-check records it and the run continues from the log.
 
+TUNE_SECS=60		# per step
+CONFIRM_SECS=600	# final check
+TUNE_MAX_CRASHES=8
+
+tlog() {
+	echo "$*" >> $TUNE
+	sync
+}
+
+tune_active() {
+	[ -s $TUNE ] || return 1
+	case "$(tail -n 1 $TUNE)" in DONE*|STOPPED*) return 1 ;; esac
+	return 0
+}
+
+outcome() {	# key -> PASS|FAIL|CRASH|""
+	grep -E "^(PASS|FAIL|CRASH) $1\$" $TUNE | tail -n 1 | cut -d' ' -f1
+}
+
+# One tuning step: pin KHZ with OFFSET on LEVEL, stress for SECS. Skipped if
+# the log already has its outcome. Status: passed or not.
+do_step() {	# key khz level offset secs
+	if [ -z "$(outcome "$1")" ]; then
+		if ! set_offset "$3" "$4"; then
+			tlog "FAIL $1"
+		else
+			tlog "TRY $1"
+			pin "$2"
+			if run_stress "$5"; then
+				tlog "PASS $1"
+			else
+				tlog "FAIL $1"
+			fi
+			unpin
+		fi
+	fi
+	[ "$(outcome "$1")" = PASS ]
+}
+
+speeds_up_to() {	# max_khz -> boost speeds <= max, ascending
+	local f
+
+	for f in $(boost_freqs); do
+		[ "$f" -le "$1" ] && echo "$f"
+	done
+}
+
+tune_speed() {
+	local extreme top f lvl off best="" best_off o6 lim
+
+	extreme=$(sed -n 's/^JOB speed extreme=\([01]\).*/\1/p' $TUNE)
+	top=$FAMILY_MAX
+	[ "$extreme" = 1 ] && for f in $(boost_freqs); do top=$f; done
+	o6=$OFFSET_6
+	best_off=$o6
+
+	for f in $(speeds_up_to "$top"); do
+		lvl=$(level_of "$f")
+		if [ "$f" -le $FAMILY_MAX ]; then
+			eval off=\$OFFSET_$lvl
+			do_step "s $f $off" "$f" "$lvl" "$off" $TUNE_SECS || break
+			best=$f
+			continue
+		fi
+		# extreme speeds: raise the top level 32 mV at a time until it
+		# passes, as far as the voltage cap and the kernel allow
+		off=$o6
+		while :; do
+			if do_step "s $f $off" "$f" 6 "$off" $TUNE_SECS; then
+				best=$f; best_off=$off; o6=$off
+				break
+			fi
+			off=$((off + 32000))
+			lim=$(cap_offset 6)
+			[ -n "$lim" ] && [ $off -gt $lim ] && { off=limit; break; }
+			set_offset 6 "$off" || { off=limit; break; }
+		done
+		[ "$off" = limit ] && break
+	done
+	set_offset 6 "$OFFSET_6"
+
+	if [ -z "$best" ]; then
+		tlog "RESULT none: not even $(speeds_up_to "$top" | head -n 1) kHz was stable"
+		return
+	fi
+
+	# confirm with a longer test, stepping down on failure
+	while [ -n "$best" ]; do
+		lvl=$(level_of "$best")
+		if [ "$lvl" = 6 ]; then off=$best_off; else eval off=\$OFFSET_$lvl; fi
+		if do_step "c $best $off" "$best" "$lvl" "$off" $CONFIRM_SECS; then
+			uci -q set $CONFIG.main.enabled=1
+			uci -q set $CONFIG.main.mode=advanced
+			uci -q set $CONFIG.main.max_freq="$best"
+			[ "$best" -gt $FAMILY_MAX ] && uci -q set $CONFIG.main.extreme=1
+			[ "$lvl" = 6 ] && [ "$off" != "$OFFSET_6" ] && uci -q set $CONFIG.main.offset_6="$off"
+			uci -q delete $CONFIG.main.disabled_reason
+			uci -q commit $CONFIG
+			load
+			uci -q set $CONFIG.main.last_good="$(snapshot)"
+			uci -q commit $CONFIG
+			tlog "RESULT max_freq=$best offset_6=$off"
+			return
+		fi
+		best=$(speeds_up_to $((best - 1)) | tail -n 1)
+		[ -n "$best" ] && [ "$best" -le $FAMILY_MAX ] && best_off=$OFFSET_6
+	done
+	tlog "RESULT none: no speed passed the final check"
+}
+
+tune_voltage() {
+	local lvl f k off start low result max r o
+
+	max=$EFF_MAX
+	for lvl in 1 2 3 4 5 6; do
+		# the highest speed in use on this level
+		f=""
+		for k in $(stock_freqs) $(speeds_up_to "$max"); do
+			[ "$(level_of "$k")" = "$lvl" ] && f=$k
+		done
+		[ -n "$f" ] || continue
+		r=$(sed -n "s/^LEVEL $lvl result=\(-*[0-9]*\)\$/\1/p" $TUNE)
+		if [ -n "$r" ]; then
+			set_offset "$lvl" "$r"
+			eval OFFSET_$lvl=$r
+			continue
+		fi
+		eval start=\$OFFSET_$lvl
+		low=$start
+		off=$start
+		while [ $off -ge $((start - 160000)) ]; do
+			do_step "v $lvl $off" "$f" "$lvl" "$off" $TUNE_SECS || break
+			low=$off
+			off=$((off - 16000))
+		done
+		result=$((low + 32000))
+		[ $result -gt $start ] && result=$start
+		set_offset "$lvl" "$result"
+		eval OFFSET_$lvl=$result
+		tlog "LEVEL $lvl result=$result"
+	done
+
+	o="$OFFSET_1 $OFFSET_2 $OFFSET_3 $OFFSET_4 $OFFSET_5 $OFFSET_6"
+	set_offsets $o
+	lvl=$(level_of "$max")
+	eval off=\$OFFSET_$lvl
+	if do_step "c $max $(echo $o | tr ' ' ',')" "$max" "$lvl" "$off" $CONFIRM_SECS; then
+		uci -q set $CONFIG.main.mode=advanced
+		uci -q set $CONFIG.main.max_freq="$max"
+		for lvl in 1 2 3 4 5 6; do
+			eval uci -q set $CONFIG.main.offset_$lvl=\$OFFSET_$lvl
+		done
+		uci -q commit $CONFIG
+		load
+		uci -q set $CONFIG.main.last_good="$(snapshot)"
+		uci -q commit $CONFIG
+		tlog "RESULT offsets=$(echo $o | tr ' ' ',')"
+	else
+		tlog "RESULT none: the final check failed; voltages left as they were"
+	fi
+}
+
+cmd_tune_run() {
+	local kind crashes
+
+	mkdir -p $WORK
+	[ "$1" = resume ] && sleep 60		# let the router finish booting
+	tune_active || exit 0
+	crashes=$(grep -c '^CRASH' $TUNE)
+	if [ "$crashes" -gt $TUNE_MAX_CRASHES ]; then
+		tlog "RESULT none: stopped after $crashes crashes"
+	else
+		load
+		effective
+		kind=$(sed -n 's/^JOB \([a-z]*\).*/\1/p' $TUNE)
+		case "$kind" in
+		speed) tune_speed ;;
+		voltage) tune_voltage ;;
+		esac
+	fi
+	unpin
+	cmd_apply
+	tlog "DONE $(date +%s)"
+	logger -t mx4300-cpu-oc "tuning finished: $(grep '^RESULT' $TUNE | tail -n 1)"
+}
+
+cmd_tune() {
+	case "$1" in
+	speed|voltage) ;;
+	stop)
+		tune_active || die "no tuning run in progress"
+		start-stop-daemon -K -p $TUNE_PID -s TERM 2>/dev/null
+		pkill -f mx4300-cpu-oc-stress 2>/dev/null
+		tlog "STOPPED $(date +%s)"
+		unpin
+		cmd_apply
+		echo "stopped"
+		return ;;
+	*) die "usage: mx4300-cpu-oc tune speed|voltage|stop" ;;
+	esac
 	load
+	effective
+	tune_active && die "a tuning run is already in progress"
+	[ "$(test_get | jsonfilter -e '@.state')" = running ] && die "a stability test is running"
+	[ "$1" = voltage ] && [ "$ENABLED" != 1 ] &&
+		die "turn overclocking on first: voltage tuning works on the speeds in use"
+	echo "JOB $1 extreme=$EXTREME started=$(date +%s)" > $TUNE
+	sync
+	rm -f $TUNE_PID
+	start-stop-daemon -S -b -m -p $TUNE_PID -x /bin/sh -- "$0" tune-run ||
+		die "could not start tuning"
+	echo "started"
+}
+
+tune_json() {
+	local l
+
+	[ -s $TUNE ] || { echo '{ "state": "none" }'; return; }
+	json_init
+	if tune_active; then
+		json_add_string state running
+	elif tail -n 1 $TUNE | grep -q '^STOPPED'; then
+		json_add_string state stopped
+	else
+		json_add_string state done
+	fi
+	json_add_string job "$(sed -n 's/^JOB \([a-z]*\).*/\1/p' $TUNE)"
+	json_add_string result "$(grep '^RESULT' $TUNE | tail -n 1 | sed 's/^RESULT //')"
+	json_add_int steps "$(grep -cE '^(PASS|FAIL|CRASH)' $TUNE)"
+	json_add_int crashes "$(grep -c '^CRASH' $TUNE)"
+	json_add_string current "$(tail -n 1 $TUNE | sed -n 's/^TRY //p')"
+	json_add_array log
+	grep -E '^(PASS|FAIL|CRASH|RESULT|LEVEL)' $TUNE | tail -n 40 > $WORK/tune.tail 2>/dev/null
+	while read -r l; do json_add_string "" "$l"; done < $WORK/tune.tail
+	json_close_array
+	json_dump
+}
+
+cmd_status() {
+	local f lvl s last tune
+
+	mkdir -p $WORK
+	load
+	effective
 	json_init
 	json_add_boolean enabled "$ENABLED"
+	json_add_string mode "$MODE"
+	json_add_string preset "$PRESET"
 	json_add_int max_freq "$MAX_FREQ"
+	json_add_boolean extreme "$EXTREME"
+	json_add_string volt_cap "$VOLT_CAP"
+	json_add_int cap_uv "${CAP:-1064000}"
+	json_add_int effective_max "$EFF_MAX"
 	json_add_int stock_max "$STOCK_MAX"
+	json_add_int family_max "$FAMILY_MAX"
 	json_add_string disabled_reason "$REASON"
+	json_add_boolean last_good "$([ -n "$LAST_GOOD" ] && echo 1 || echo 0)"
 	json_add_boolean boost "$(cat $BOOST 2>/dev/null || echo 0)"
 	json_add_int cur_freq "$(cat $POLICY/scaling_cur_freq)"
 	json_add_int limit_freq "$(cat $POLICY/scaling_max_freq)"
 	json_add_int temp "$(cpu_temp)"
+	json_add_boolean voltage_control "$([ -w $CPR/corner/offset_volt ] && echo 1 || echo 0)"
+	json_add_int cur_volt "$(cat $CPR/current_corner/last_volt 2>/dev/null || echo 0)"
 	json_add_array stock_freqs
 	for f in $(stock_freqs); do json_add_int "" "$f"; done
 	json_close_array
 	json_add_array boost_freqs
 	for f in $(boost_freqs); do json_add_int "" "$f"; done
 	json_close_array
+	json_add_array levels
+	for lvl in 1 2 3 4 5 6; do
+		json_add_object ""
+		json_add_int level "$lvl"
+		eval json_add_int offset_set \$OFFSET_$lvl
+		json_add_int stock_ceiling "$(stock_ceiling $lvl || echo 0)"
+		json_add_int offset "$(get_level $lvl offset_volt)"
+		json_add_int volt "$(get_level $lvl last_volt)"
+		json_add_int floor "$(get_level $lvl floor_volt)"
+		json_add_int ceiling "$(get_level $lvl ceiling_volt)"
+		# lowest offset that passed voltage tuning on this level, if it ran
+		f=$(sed -n "s/^PASS v $lvl \(-*[0-9]*\)\$/\1/p" $TUNE 2>/dev/null | sort -n | head -n 1)
+		[ -n "$f" ] && json_add_int min_offset "$f"
+		json_close_object
+	done
+	json_close_array
 	s=$(json_dump)
 	last=$(test_get)
 	[ "$(echo "$last" | jsonfilter -e '@.state')" = none ] && [ -s /etc/mx4300-cpu-oc.lasttest ] &&
 		last=$(cat /etc/mx4300-cpu-oc.lasttest)
-	echo "${s% \}}, \"test\": $last }"
+	tune=$(tune_json)
+	echo "${s% \}}, \"test\": $last, \"tune\": $tune }"
 }
 
 cmd=$1
@@ -219,6 +682,9 @@ case "$cmd" in
 	test)		cmd_test "$@" ;;
 	test-run)	cmd_test_run "$@" ;;
 	test-status)	test_get ;;
+	tune)		cmd_tune "$@" ;;
+	tune-run)	cmd_tune_run "$@" ;;
+	tune-status)	tune_json ;;
 	crash-check)	cmd_crash_check ;;
-	*)		sed -n '2,11s/^# \{0,1\}//p' "$0"; exit 1 ;;
+	*)		sed -n '2,18s/^# \{0,1\}//p' "$0"; exit 1 ;;
 esac

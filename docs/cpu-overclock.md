@@ -3,10 +3,14 @@
 The Linksys MX4300's IPQ8174 is the 1.4 GHz member of Qualcomm's IPQ807x
 family, and stock firmware runs it at 1017.6 and 1382.4 MHz. This firmware
 can run it at up to **2208 MHz**, the speed of the 2.2 GHz members of the same
-family (IPQ8072A/IPQ8074A). It is **off by default**.
+family (IPQ8072A/IPQ8074A), and, as an untested-by-Qualcomm *extreme* option,
+up to 2688 MHz with a raised voltage. It is **off by default**.
 
 - [Turning it on](#turning-it-on)
 - [What it gains](#what-it-gains)
+- [Voltage limit](#voltage-limit)
+- [Extreme speeds](#extreme-speeds)
+- [Automatic tuning](#automatic-tuning)
 - [Risks and safeguards](#risks-and-safeguards)
 - [How it works](#how-it-works)
 - [Measurements](#measurements)
@@ -17,21 +21,42 @@ family (IPQ8072A/IPQ8074A). It is **off by default**.
 
 In LuCI: **System → CPU Overclock**.
 
+**Simple mode** (the default view):
+
 1. Read the warning on the page.
-2. Tick *Allow overclocking*, pick the *Highest speed*, and save.
-3. Run the *Stability test* at that speed (5 or 15 minutes). If it fails,
-   overclocking turns itself off; pick a lower speed.
+2. Tick *Allow overclocking* and pick a preset: *Balanced* (up to 1843.2 MHz,
+   +33 %) or *Performance* (up to 2208 MHz, +60 %). Voltages are automatic.
+3. Run the *Stability test* at that speed (5 or 15 minutes).
+
+**Advanced mode** adds:
+
+- **Any speed** as the maximum, and **extreme speeds** above 2208 MHz behind
+  their own switch and warning (see [Extreme speeds](#extreme-speeds)).
+- **A voltage offset for each voltage level**, in 8 mV steps (−160 to
+  +128 mV; the kernel keeps every level between 592 and 1064 mV), with a live
+  table of each level's voltage, floor and ceiling. 0 means automatic, as
+  stock.
+- **A voltage limit** (see [Voltage limit](#voltage-limit)).
+- **Automatic tuning** (see [Automatic tuning](#automatic-tuning)).
+
+Both modes show a **speed and voltage chart**, drawn with the same chart
+component as LuCI's Dashboard: the voltage the controller gives each speed
+(the speeds allowed now in the first colour, the rest in the second), with
+markers where each voltage level (L1–L6) starts. After voltage tuning, a third
+line shows the lowest voltage that passed on each level; the gap between the
+lines is the safety margin.
 
 The CPU still idles at 1017.6 MHz and only speeds up when there is work to
 do; the kernel's `schedutil` governor picks the speed from the load, up to
-the highest speed you allowed. The CPU voltage is set for every speed by the
-SoC's own voltage controller, as for the stock speeds.
+the highest speed you allowed.
 
-To go back to stock, untick *Allow overclocking*. Nothing else changes.
+To go back to stock, untick *Allow overclocking*: speeds and voltage offsets
+return to stock.
 
 ## What it gains
 
-Speeds offered: 1497.6, 1651.2, 1843.2, 1920, 2073.6 and 2208 MHz.
+Speeds offered: 1497.6, 1651.2, 1843.2, 1920, 2073.6 and 2208 MHz, plus the
+extreme speeds 2304, 2400, 2496, 2592 and 2688 MHz in advanced mode.
 
 The CPU is only busy with work it does itself: Passwall/Xray proxying and its
 encryption, Passwall servers, VPNs (WireGuard, OpenConnect), DNS, the web
@@ -53,6 +78,74 @@ interface, package installs. That work speeds up in line with the clock:
 and the Wi-Fi firmware handle it). Overclocking does not change Wi-Fi or
 gigabit throughput.
 
+## Voltage limit
+
+What wears a chip out is voltage and heat, not clock speed: at a given
+voltage, a speed that is too high makes the CPU miscalculate or crash (the
+stability test and tuning catch that), it does not damage it. The voltage
+limit keeps every voltage level's CPR ceiling at or below one value, whatever
+the offsets or tuning ask for, so speed can be pushed as far as the chip
+allows *at a voltage known to be harmless*:
+
+| Limit | Value | Meaning |
+|---|---|---|
+| **Family normal** (default) | 944 mV | The top CPR voltage of this chip family at its stock 2208 MHz: what the 2.2 GHz IPQ8074A versions of the same silicon run every day. No positive offsets. |
+| **This chip's stock** | 776 mV | The highest CPR ceiling stock firmware ever gives this IPQ8174 (at 1382.4 MHz). Levels 3–6 get negative offsets that bring their ceilings down to it. |
+| **None** | 1064 mV | Only the kernel's hard limit; needed for most extreme speeds. |
+
+Simple mode always stays within the family normal voltage. *Find my maximum
+speed* respects the limit: it never raises a voltage above it, so with the
+default it finds the fastest speed this chip runs at the family's normal
+voltage. On the router measured below that was 2400 MHz (2496 MHz passed
+once and crashed once at the same voltage), against about 1.98 GHz at this
+chip's own stock 760–776 mV.
+
+## Extreme speeds
+
+Above 2208 MHz no chip of this family is sold, and the voltage controller has
+no calibration data: these speeds use the top voltage level, raised with
+offset 6. On the one MX4300 they were tested on (60 s of full load per step):
+
+| Speed | Top-level voltage that passed | Recommended offset 6 |
+|---|---|---|
+| 2304, 2400, 2496 MHz | 936 mV (no offset) | +32 mV |
+| 2592 MHz | 1000 mV (crashed at 936 mV) | +96 mV |
+| 2688 MHz | 1032 mV (crashed at 1000 mV) | +128 mV |
+| 2784 MHz | none: crashed at 1032 and 1064 mV | – |
+
+A second run, by *Find my maximum speed* on the same router, landed on the
+same edge from the other side: 2496 MHz crashed at the normal voltage this
+time (+32 mV passed), 2592 MHz needed +64 mV, 2688 MHz crashed at +64 and
++96 mV, and the ten-minute confirmation failed at 2592 MHz and passed at
+2496 MHz with +64 mV. A speed that passes one test and crashes the next is
+running at its edge: leave a margin.
+
+1064 mV is the highest voltage Qualcomm uses on this chip family and the
+firmware's hard limit. Your chip will differ: use *Find my maximum speed*
+with *Allow extreme speeds* ticked, or raise offset 6 step by step and run
+the stability test after each step.
+
+## Automatic tuning
+
+Both runs measure *this* router's chip with one-minute stress tests per
+step, confirm the result with a ten-minute test, and save it (switching to
+advanced mode). They expect to crash the router while searching for its
+limit: every crash restarts the router (about two minutes without internet
+and Wi-Fi), is recorded as a failed step, and the run continues by itself
+after the restart.
+
+- **Find my maximum speed** tries each speed from the bottom up and keeps
+  the highest that passes. With extreme speeds allowed it continues past
+  2208 MHz, raising offset 6 by 32 mV at a time up to the 1064 mV limit.
+- **Lower voltages automatically** takes each voltage level in use, lowers
+  its offset 16 mV at a time until a test fails, and keeps the lowest passing
+  value plus 32 mV (never above where it started). The voltage controller's
+  own choice carries a generic margin (about 100 mV on the chip measured
+  below); this finds your chip's own curve instead.
+
+A run stops after eight crashes, and *Stop tuning* ends it at any time,
+restoring the saved settings.
+
 ## Risks and safeguards
 
 **Risks.** Running a chip above its rated speed is outside Qualcomm's
@@ -69,11 +162,14 @@ the chip's life. There is no warranty.
   never enables overclocking never runs above 1382.4 MHz, not even during
   boot.
 - **Stability test.** Holds the CPU at a speed under a full CPU and memory
-  load and checks every result; a failure turns overclocking off.
+  load and checks every result. A pass records the settings as *last good*;
+  a failure goes back to the last good settings, or turns overclocking off.
 - **Crash detection.** If the router crashes or hangs while overclocked, the
-  next boot sees it in the kernel's crash records (pstore), turns
-  overclocking off, and says so on the LuCI page. A power cut leaves no
-  record and does not count.
+  next boot sees it in the kernel's crash records (pstore), goes back to the
+  last good settings (or turns overclocking off), and says so on the LuCI
+  page. A power cut leaves no record and does not count.
+- **Hard limits.** The kernel refuses any voltage outside 592–1064 mV, and a
+  test stops as failed above 90 °C (the CPU itself throttles at 95 °C).
 - **Voltage from CPR.** The CPU voltage is not a fixed overclocking value: the
   SoC's closed-loop voltage controller (CPR) sets it from on-chip
   measurements, as for the stock speeds. On one MX4300 it chose about 100 mV
@@ -107,12 +203,20 @@ Three findings, all measured on an MX4300:
   from GPLL2 when the device tree hands it in, and to park the CPU on GPLL0
   while either PLL changes rate (the mechanism mainline already uses on
   IPQ53xx). GCC latches GPLL2 rate changes.
-- **`cpufreq: let schedutil reach boost frequencies`**: schedutil maps a fully
-  busy CPU to a reference frequency that the kernel records once, when the
-  cpufreq policy is created. With boost off at that point the reference is
-  1382.4 MHz, and switching boost on later made the faster speeds selectable
-  by hand but never by schedutil. The patch moves the reference along when
-  boost changes.
+- **`cpufreq: boost: let schedutil reach boost frequencies, …`**: schedutil
+  maps a fully busy CPU to a reference frequency that the kernel records
+  once, when the cpufreq policy is created. With boost off at that point the
+  reference is 1382.4 MHz, and switching boost on later made the faster
+  speeds selectable by hand but never by schedutil. The patch moves the
+  reference along when boost changes. Enabling boost also no longer raises
+  the speed limit by itself: userspace raises it after setting the voltage,
+  so the extreme speeds are never reached at the normal voltage.
+- **`regulator: cpr3: runtime voltage offset per corner`** adds a writable
+  `offset_volt` next to each CPR level's readouts in debugfs
+  (`/sys/kernel/debug/cpr3-regulator/apc/thread0/apc_corner/corner/`). An
+  offset moves the level's floor, ceiling, open-loop voltage and target
+  quotients together, so closed-loop CPR keeps adapting around the new
+  point.
 - **The MX4300 device tree** hands GPLL2 to the APCS block and adds the boost
   operating points; each uses the CPR corner calibrated for its own speed or
   a higher one.
@@ -147,18 +251,28 @@ stability test is for.
 ## Command line
 
 ```
-mx4300-cpu-oc status            # settings, speeds, temperature, last test (JSON)
+mx4300-cpu-oc status            # settings, speeds, voltages, test, tuning (JSON)
 mx4300-cpu-oc apply             # apply /etc/config/mx4300-cpu-oc
 mx4300-cpu-oc test 300 2208000  # stability test: 300 s at 2208 MHz
+mx4300-cpu-oc tune speed        # find the highest stable speed
+mx4300-cpu-oc tune voltage      # lower the voltage levels in use
+mx4300-cpu-oc tune stop
 ```
 
-Settings (`/etc/config/mx4300-cpu-oc`):
+Settings (`/etc/config/mx4300-cpu-oc`), for example:
 
 ```
 config cpu-oc 'main'
 	option enabled '1'
-	option max_freq '2208000'
+	option mode 'advanced'
+	option max_freq '2400000'
+	option extreme '1'
+	option volt_cap 'none'
+	option offset_6 '32000'
 ```
+
+Voltage levels: 1 = 1017.6 MHz, 2 = 1382.4 MHz, 3 = 1497.6–1651.2 MHz,
+4 = 1843.2 MHz, 5 = 1920 MHz, 6 = 2073.6 MHz and above.
 
 The kernel interface underneath is plain cpufreq:
 `/sys/devices/system/cpu/cpufreq/boost` (0 or 1) and

@@ -3,16 +3,32 @@
 		"description": "Grant access to CPU overclocking (mx4300-cpu-oc)",
 		"read": {
 			"file": {
-				"/usr/sbin/mx4300-cpu-oc status": [ "exec" ],
-				"/usr/sbin/mx4300-cpu-oc test-status": [ "exec" ]
+				"/usr/sbin/mx4300-cpu-oc status": [
+					"exec"
+				],
+				"/usr/sbin/mx4300-cpu-oc test-status": [
+					"exec"
+				],
+				"/usr/sbin/mx4300-cpu-oc tune-status": [
+					"exec"
+				]
 			},
-			"uci": [ "mx4300-cpu-oc" ]
+			"uci": [
+				"mx4300-cpu-oc"
+			]
 		},
 		"write": {
 			"file": {
-				"/usr/sbin/mx4300-cpu-oc test *": [ "exec" ]
+				"/usr/sbin/mx4300-cpu-oc test *": [
+					"exec"
+				],
+				"/usr/sbin/mx4300-cpu-oc tune *": [
+					"exec"
+				]
 			},
-			"uci": [ "mx4300-cpu-oc" ]
+			"uci": [
+				"mx4300-cpu-oc"
+			]
 		}
 	}
 }

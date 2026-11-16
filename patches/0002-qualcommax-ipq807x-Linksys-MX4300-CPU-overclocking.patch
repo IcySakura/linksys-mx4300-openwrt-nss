@@ -17,18 +17,20 @@ when fed from GCC's GPLL2, which reaches the APSS mux as source 2.
   points until /sys/devices/system/cpu/cpufreq/boost is set, so the stock
   1382.4 MHz limit stays the default.
 ---
- .../linux/qualcommax/dts/ipq8174-mx4300.dts   |  52 +++++
+ .../linux/qualcommax/dts/ipq8174-mx4300.dts   |  94 +++++++++
  ...-from-GPLL2-above-the-APSS-PLL-limit.patch | 187 ++++++++++++++++++
- ...et-schedutil-reach-boost-frequencies.patch |  56 ++++++
- 3 files changed, 295 insertions(+)
+ ...et-schedutil-reach-boost-frequencies.patch |  71 +++++++
+ ...r3-runtime-voltage-offset-per-corner.patch | 138 +++++++++++++
+ 4 files changed, 490 insertions(+)
  create mode 100644 target/linux/qualcommax/patches-6.18/9900-clk-qcom-ipq8074-run-the-CPU-from-GPLL2-above-the-APSS-PLL-limit.patch
  create mode 100644 target/linux/qualcommax/patches-6.18/9901-cpufreq-let-schedutil-reach-boost-frequencies.patch
+ create mode 100644 target/linux/qualcommax/patches-6.18/9902-regulator-cpr3-runtime-voltage-offset-per-corner.patch
 
 diff --git a/target/linux/qualcommax/dts/ipq8174-mx4300.dts b/target/linux/qualcommax/dts/ipq8174-mx4300.dts
-index 3b84d48d6a..24e9853fde 100644
+index 3b84d48d6a..356c0f8773 100644
 --- a/target/linux/qualcommax/dts/ipq8174-mx4300.dts
 +++ b/target/linux/qualcommax/dts/ipq8174-mx4300.dts
-@@ -315,3 +315,55 @@
+@@ -315,3 +315,97 @@
  
  	qcom,calibration-variant = "Linksys-MX4200v1";
  };
@@ -80,6 +82,48 @@ index 3b84d48d6a..24e9853fde 100644
 +	};
 +
 +	opp-2208000000 {
++		opp-supported-hw = <0xf>;
++		turbo-mode;
++	};
++
++	/* Extreme: above the IPQ807x family's 2208 MHz; mx4300-cpu-oc offers
++	 * these only when asked to, with a raised voltage offset on corner 6. */
++	opp-2304000000 {
++		opp-hz = /bits/ 64 <2304000000>;
++		opp-microvolt = <6>;
++		clock-latency-ns = <200000>;
++		opp-supported-hw = <0xf>;
++		turbo-mode;
++	};
++
++	opp-2400000000 {
++		opp-hz = /bits/ 64 <2400000000>;
++		opp-microvolt = <6>;
++		clock-latency-ns = <200000>;
++		opp-supported-hw = <0xf>;
++		turbo-mode;
++	};
++
++	opp-2496000000 {
++		opp-hz = /bits/ 64 <2496000000>;
++		opp-microvolt = <6>;
++		clock-latency-ns = <200000>;
++		opp-supported-hw = <0xf>;
++		turbo-mode;
++	};
++
++	opp-2592000000 {
++		opp-hz = /bits/ 64 <2592000000>;
++		opp-microvolt = <6>;
++		clock-latency-ns = <200000>;
++		opp-supported-hw = <0xf>;
++		turbo-mode;
++	};
++
++	opp-2688000000 {
++		opp-hz = /bits/ 64 <2688000000>;
++		opp-microvolt = <6>;
++		clock-latency-ns = <200000>;
 +		opp-supported-hw = <0xf>;
 +		turbo-mode;
 +	};
@@ -279,26 +323,32 @@ index 0000000000..a9f9c8a35d
 + 		.enable_mask = BIT(2),
 diff --git a/target/linux/qualcommax/patches-6.18/9901-cpufreq-let-schedutil-reach-boost-frequencies.patch b/target/linux/qualcommax/patches-6.18/9901-cpufreq-let-schedutil-reach-boost-frequencies.patch
 new file mode 100644
-index 0000000000..cf5d157ae1
+index 0000000000..f99064e238
 --- /dev/null
 +++ b/target/linux/qualcommax/patches-6.18/9901-cpufreq-let-schedutil-reach-boost-frequencies.patch
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,71 @@
 +From: Myles Liu <lyx981mike@gmail.com>
-+Subject: cpufreq: let schedutil reach boost frequencies
++Subject: cpufreq: boost: let schedutil reach boost frequencies, leave the
++ limit to userspace
 +
 +schedutil maps full utilization to the CPUs' reference frequency, which
 +arch_topology (init_cpu_capacity_callback) takes from cpuinfo.max_freq
 +once, when the cpufreq policy is created. With boost off at that moment the
 +reference stays at the highest non-boost frequency, and enabling boost
 +later makes the boost frequencies selectable by hand but never by
-+schedutil: a fully busy CPU still asks for the old maximum.
++schedutil: a fully busy CPU still asks for the old maximum. When software
++boost changes cpuinfo.max_freq, move the reference along, for the CPUs
++whose reference was taken from it.
 +
-+When software boost changes cpuinfo.max_freq, move the reference along,
-+for the CPUs whose reference was taken from it.
++Enabling boost also no longer raises the policy limit to the top boost
++frequency: on the MX4300 the top boost frequencies need a raised voltage,
++so userspace raises scaling_max_freq itself, after setting the voltage.
++Disabling boost still lowers the limit.
 +
 +Signed-off-by: Myles Liu <lyx981mike@gmail.com>
++
 +--- a/drivers/cpufreq/cpufreq.c	2026-11-15 19:56:46.466996596 -0800
-++++ b/drivers/cpufreq/cpufreq.c	2026-11-15 19:56:46.486996755 -0800
+++++ b/drivers/cpufreq/cpufreq.c	2026-11-15 21:13:06.380283371 -0800
 +@@ -14,6 +14,7 @@
 + 
 + #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -307,15 +357,16 @@ index 0000000000..cf5d157ae1
 + #include <linux/cpu.h>
 + #include <linux/cpufreq.h>
 + #include <linux/cpu_cooling.h>
-+@@ -2782,6 +2783,7 @@
++@@ -2782,6 +2783,8 @@
 +  *********************************************************************/
 + int cpufreq_boost_set_sw(struct cpufreq_policy *policy, int state)
 + {
 ++	unsigned int old_max = policy->cpuinfo.max_freq;
+++	unsigned int old_limit = policy->max;
 + 	int ret;
 + 
 + 	if (!policy->freq_table)
-+@@ -2793,6 +2795,23 @@
++@@ -2793,6 +2796,31 @@
 + 		return ret;
 + 	}
 + 
@@ -336,6 +387,158 @@ index 0000000000..cf5d157ae1
 ++	}
 ++#endif
 ++
+++	/*
+++	 * Enabling boost makes the boost frequencies available without raising
+++	 * the limit: userspace raises scaling_max_freq when it is ready for
+++	 * them (e.g. after adjusting the voltage). Disabling boost still lowers
+++	 * the limit to the highest non-boost frequency.
+++	 */
+++	if (state)
+++		policy->max = min(old_limit, policy->max);
 + 	ret = freq_qos_update_request(policy->max_freq_req, policy->max);
 + 	if (ret < 0)
 + 		return ret;
+diff --git a/target/linux/qualcommax/patches-6.18/9902-regulator-cpr3-runtime-voltage-offset-per-corner.patch b/target/linux/qualcommax/patches-6.18/9902-regulator-cpr3-runtime-voltage-offset-per-corner.patch
+new file mode 100644
+index 0000000000..86fe958be4
+--- /dev/null
++++ b/target/linux/qualcommax/patches-6.18/9902-regulator-cpr3-runtime-voltage-offset-per-corner.patch
+@@ -0,0 +1,138 @@
++From: Myles Liu <lyx981mike@gmail.com>
++Subject: regulator: cpr3: runtime voltage offset per corner
++
++Add a debugfs file, offset_volt, next to each corner's floor_volt,
++ceiling_volt and open_loop_volt (writable for the corner selected through
++corner/index). Writing an offset in microvolts shifts that corner's floor,
++ceiling, open-loop and last voltages by the change, and its target
++quotients by the matching amount (cpr3_quot_adjustment with the corner's
++RO scaling factors), then re-aggregates the controller state. Closed-loop
++CPR keeps adapting around the new point.
++
++The result must keep the corner between 592 and 1064 mV; offsets are
++limited to +-200 mV.
++
++Used by mx4300-cpu-oc for voltage tuning and for speeds above 2208 MHz.
++
++Signed-off-by: Myles Liu <lyx981mike@gmail.com>
++
++--- a/drivers/regulator/cpr3-regulator.h	2026-11-15 20:40:04.246348753 -0800
+++++ b/drivers/regulator/cpr3-regulator.h	2026-11-15 20:40:33.796561695 -0800
++@@ -143,6 +143,10 @@
++  *			corner on CPRh controllers.
++  * @sdelta:		The CPR4 controller specific data for this corner. This
++  *			field is applicable for CPR4 controllers.
+++ * @user_offset_volt:	Voltage offset in microvolts requested at runtime
+++ *			through debugfs (offset_volt), already applied to the
+++ *			floor, ceiling, open-loop and last voltages and to the
+++ *			target quotients of this corner.
++  *
++  * The value of last_volt is initialized inside of the cpr3_regulator_register()
++  * call with the open_loop_volt value.  It can later be updated to the settled
++@@ -177,6 +181,7 @@
++ 	int			aging_derate;
++ 	bool			use_open_loop;
++ 	struct cpr4_sdelta	*sdelta;
+++	int			user_offset_volt;
++ };
++ 
++ /**
++--- a/drivers/regulator/cpr3-regulator.c	2026-11-15 20:40:04.246348753 -0800
+++++ b/drivers/regulator/cpr3-regulator.c	2026-11-15 22:08:41.102864510 -0800
++@@ -3744,6 +3744,78 @@
++ DEFINE_SIMPLE_ATTRIBUTE(cpr3_debug_corner_int_fops, cpr3_debug_corner_int_get,
++ 			NULL, "%lld\n");
++ 
+++/*
+++ * Runtime voltage offset for one corner (debugfs "offset_volt" next to the
+++ * corner's index file). Shifts the corner's floor, ceiling, open-loop and
+++ * last voltages by the change in offset and moves its target quotients by
+++ * the matching amount, so closed-loop CPR keeps working around the new
+++ * point. The result must stay inside the absolute limits below.
+++ */
+++#define CPR3_USER_OFFSET_LIMIT		200000
+++#define CPR3_USER_VOLT_MIN		592000
+++#define CPR3_USER_VOLT_MAX		1064000
+++
+++static int cpr3_debug_corner_offset_get(void *data, u64 *val)
+++{
+++	struct cpr3_debug_corner_info *info = data;
+++	struct cpr3_controller *ctrl = info->vreg->thread->ctrl;
+++	int i;
+++
+++	mutex_lock(&ctrl->lock);
+++	i = max(*info->index, 0);
+++	*val = (s64)info->vreg->corner[i].user_offset_volt;
+++	mutex_unlock(&ctrl->lock);
+++
+++	return 0;
+++}
+++
+++static int cpr3_debug_corner_offset_set(void *data, u64 val)
+++{
+++	struct cpr3_debug_corner_info *info = data;
+++	struct cpr3_regulator *vreg = info->vreg;
+++	struct cpr3_controller *ctrl = vreg->thread->ctrl;
+++	struct cpr3_corner *corner;
+++	int offset = (int)(s64)val;
+++	int delta, i, rc;
+++
+++	if (offset < -CPR3_USER_OFFSET_LIMIT || offset > CPR3_USER_OFFSET_LIMIT)
+++		return -EINVAL;
+++
+++	mutex_lock(&ctrl->lock);
+++
+++	corner = &vreg->corner[max(*info->index, 0)];
+++	delta = offset - corner->user_offset_volt;
+++	if (corner->floor_volt + delta < CPR3_USER_VOLT_MIN ||
+++	    corner->ceiling_volt + delta > CPR3_USER_VOLT_MAX) {
+++		mutex_unlock(&ctrl->lock);
+++		return -ERANGE;
+++	}
+++
+++	corner->floor_volt += delta;
+++	corner->ceiling_volt += delta;
+++	corner->open_loop_volt += delta;
+++	corner->last_volt = clamp(corner->last_volt + delta,
+++				  corner->floor_volt, corner->ceiling_volt);
+++	for (i = 0; i < CPR3_RO_COUNT; i++)
+++		if (corner->target_quot[i])
+++			corner->target_quot[i] += cpr3_quot_adjustment(
+++						corner->ro_scale[i], delta);
+++	corner->user_offset_volt = offset;
+++
+++	rc = cpr3_regulator_update_ctrl_state(ctrl);
+++
+++	mutex_unlock(&ctrl->lock);
+++
+++	cpr3_info(vreg, "corner %d offset %d uV: floor %d, ceiling %d, rc=%d\n",
+++		  max(*info->index, 0) + 1, offset, corner->floor_volt,
+++		  corner->ceiling_volt, rc);
+++
+++	return rc;
+++}
+++DEFINE_SIMPLE_ATTRIBUTE_SIGNED(cpr3_debug_corner_offset_fops,
+++			cpr3_debug_corner_offset_get,
+++			cpr3_debug_corner_offset_set, "%lld\n");
+++
++ /**
++  * cpr3_debugfs_create_corner_int - create a debugfs file that is used to read
++  *		a signed int value out of a CPR3 regulator's corner array
++@@ -3880,6 +3952,17 @@
++ 	}
++ 
++ 	info = devm_kzalloc(vreg->thread->ctrl->dev, sizeof(*info), GFP_KERNEL);
+++	if (info) {
+++		info->vreg = vreg;
+++		info->index = index;
+++		debugfs_create_file("offset_volt",
+++				    index == &vreg->debug_corner ?
+++					S_IRUGO | S_IWUSR : S_IRUGO,
+++				    corner_dir, info,
+++				    &cpr3_debug_corner_offset_fops);
+++	}
+++
+++	info = devm_kzalloc(vreg->thread->ctrl->dev, sizeof(*info), GFP_KERNEL);
++ 	if (!info)
++ 		return;
++ 
