@@ -403,6 +403,10 @@ on the Windows directories WSL adds.
   may not match; build what you need into a profile.
 - **802.11s mesh** needs NSS firmware 11.4:
   `uci set nss-wifi.general.firmware=11.4; uci commit nss-wifi; reboot`.
+- **No 160 MHz on 5 GHz.** The IPQ8174 runs both 5 GHz radios at up to
+  80 MHz, and the board cannot be switched to a layout that gives the 4x4
+  radio 160 MHz. [docs/wifi-160mhz.md](docs/wifi-160mhz.md) has what was
+  tried and why it fails.
 - The upstream maintainer tests on a different board (Xiaomi AX3600); the
   MX4300 images are built and used by others, but not tested by them.
 
@@ -421,7 +425,7 @@ configs/base.packages      packages in every profile (the firmware updater)
 profiles/                  package profiles (*.packages)
 feeds/mx4300/              this repository's packages: mx4300-ota, luci-app-mx4300-ota,
                            mx4300-cpu-oc, luci-app-mx4300-cpu-oc
-docs/                      longer documents (cpu-overclock.md)
+docs/                      longer documents (cpu-overclock.md, wifi-160mhz.md)
 scripts/build.sh           reproducible build of one or more profiles
 scripts/bump-upstream.sh   move upstream/ forward
 scripts/profile.sh         profile -> .config, and the post-defconfig check

@@ -151,11 +151,15 @@ cpu_temp() {
 # (a level outside 592-1064 mV, or a kernel without offset support).
 set_offset() {	# level uv
 	[ -w $CPR/corner/offset_volt ] || { [ "$2" = 0 ]; return; }
-	echo "$1" > $CPR/corner/index &&
+	echo "$1" > $CPR/corner/index || return 1
+	[ "$(cat $CPR/corner/offset_volt)" = "$2" ] && return 0
+	# Signed first: kernels whose file is a signed attribute refuse the
+	# unsigned form of a negative value. Older kernels parse it unsigned, so
+	# fall back to the two's complement, which reads back as the same offset.
+	echo "$2" > $CPR/corner/offset_volt 2>/dev/null &&
 		[ "$(cat $CPR/corner/offset_volt)" = "$2" ] && return 0
-	# as an unsigned 64-bit value: older kernels parse this file unsigned,
-	# and read it back as the same signed offset either way
-	printf '%u' "$2" > $CPR/corner/offset_volt 2>/dev/null
+	printf '%u' "$2" > $CPR/corner/offset_volt 2>/dev/null &&
+		[ "$(cat $CPR/corner/offset_volt)" = "$2" ]
 }
 
 get_level() {	# level field -> value, 0 if unavailable
