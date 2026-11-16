@@ -1,0 +1,18 @@
+{
+	"luci-app-mx4300-cpu-oc": {
+		"description": "Grant access to CPU overclocking (mx4300-cpu-oc)",
+		"read": {
+			"file": {
+				"/usr/sbin/mx4300-cpu-oc status": [ "exec" ],
+				"/usr/sbin/mx4300-cpu-oc test-status": [ "exec" ]
+			},
+			"uci": [ "mx4300-cpu-oc" ]
+		},
+		"write": {
+			"file": {
+				"/usr/sbin/mx4300-cpu-oc test *": [ "exec" ]
+			},
+			"uci": [ "mx4300-cpu-oc" ]
+		}
+	}
+}

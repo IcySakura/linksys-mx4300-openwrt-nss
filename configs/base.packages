@@ -17,3 +17,9 @@ luci-theme-footstrap
 # Wi-Fi clients), LuCI's landing page. To build without it:
 # "-luci-mod-dashboard" in your profile.
 luci-mod-dashboard
+
+# CPU overclocking (off by default): System -> CPU Overclock in LuCI, or
+# "mx4300-cpu-oc" on the command line; see docs/cpu-overclock.md. To build
+# without it: "-luci-app-mx4300-cpu-oc" and "-mx4300-cpu-oc" in your profile.
+mx4300-cpu-oc
+luci-app-mx4300-cpu-oc

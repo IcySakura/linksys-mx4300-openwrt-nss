@@ -1,0 +1,341 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Myles Liu <lyx981mike@gmail.com>
+Date: Sun, 15 Nov 2026 19:34:39 -0800
+Subject: [PATCH] qualcommax: ipq807x: Linksys MX4300 CPU overclocking (boost,
+ off by default)
+
+The IPQ8174's APSS PLL never runs faster than 1401.6 MHz (its multiplier
+is held at 73 inside the PLL), but the cores themselves run at 2208 MHz
+when fed from GCC's GPLL2, which reaches the APSS mux as source 2.
+
+- kernel: apss-ipq6018 takes rates above 1401.6 MHz from GPLL2 when the
+  device tree names a "gpll2" clock, parking the cores on GPLL0 during
+  every rate change; gcc-ipq8074 latches GPLL2 rate changes.
+- MX4300 device tree: hand GPLL2 to the APCS block and add boost
+  operating points at 1497.6, 1651.2, 1843.2, 1920, 2073.6 and 2208 MHz,
+  with their voltage from CPR like the stock points. cpufreq ignores boost
+  points until /sys/devices/system/cpu/cpufreq/boost is set, so the stock
+  1382.4 MHz limit stays the default.
+---
+ .../linux/qualcommax/dts/ipq8174-mx4300.dts   |  52 +++++
+ ...-from-GPLL2-above-the-APSS-PLL-limit.patch | 187 ++++++++++++++++++
+ ...et-schedutil-reach-boost-frequencies.patch |  56 ++++++
+ 3 files changed, 295 insertions(+)
+ create mode 100644 target/linux/qualcommax/patches-6.18/9900-clk-qcom-ipq8074-run-the-CPU-from-GPLL2-above-the-APSS-PLL-limit.patch
+ create mode 100644 target/linux/qualcommax/patches-6.18/9901-cpufreq-let-schedutil-reach-boost-frequencies.patch
+
+diff --git a/target/linux/qualcommax/dts/ipq8174-mx4300.dts b/target/linux/qualcommax/dts/ipq8174-mx4300.dts
+index 3b84d48d6a..24e9853fde 100644
+--- a/target/linux/qualcommax/dts/ipq8174-mx4300.dts
++++ b/target/linux/qualcommax/dts/ipq8174-mx4300.dts
+@@ -315,3 +315,55 @@
+ 
+ 	qcom,calibration-variant = "Linksys-MX4200v1";
+ };
++
++/*
++ * CPU overclocking, off by default. The IPQ8174's own CPU PLL stops at
++ * 1401.6 MHz; faster speeds come from GCC's GPLL2 (see the clk-qcom
++ * "run the CPU from GPLL2" kernel patch). They are boost operating points:
++ * cpufreq leaves them unused until /sys/devices/system/cpu/cpufreq/boost
++ * is 1, which mx4300-cpu-oc sets only when overclocking is enabled. The
++ * voltage comes from CPR as for the stock points: each maps to the CPR
++ * corner calibrated for its own speed or a higher one.
++ */
++&apcs_glb {
++	clocks = <&a53pll>, <&xo>, <&gcc GPLL0>, <&gcc GPLL2_MAIN>;
++	clock-names = "pll", "xo", "gpll0", "gpll2";
++};
++
++&cpu_opp_table {
++	opp-1497600000 {
++		opp-hz = /bits/ 64 <1497600000>;
++		opp-microvolt = <3>;
++		clock-latency-ns = <200000>;
++		opp-supported-hw = <0xf>;
++		turbo-mode;
++	};
++
++	opp-1651200000 {
++		opp-supported-hw = <0xf>;
++		turbo-mode;
++	};
++
++	opp-1843200000 {
++		opp-supported-hw = <0xf>;
++		turbo-mode;
++	};
++
++	opp-1920000000 {
++		opp-supported-hw = <0xf>;
++		turbo-mode;
++	};
++
++	opp-2073600000 {
++		opp-hz = /bits/ 64 <2073600000>;
++		opp-microvolt = <6>;
++		clock-latency-ns = <200000>;
++		opp-supported-hw = <0xf>;
++		turbo-mode;
++	};
++
++	opp-2208000000 {
++		opp-supported-hw = <0xf>;
++		turbo-mode;
++	};
++};
+diff --git a/target/linux/qualcommax/patches-6.18/9900-clk-qcom-ipq8074-run-the-CPU-from-GPLL2-above-the-APSS-PLL-limit.patch b/target/linux/qualcommax/patches-6.18/9900-clk-qcom-ipq8074-run-the-CPU-from-GPLL2-above-the-APSS-PLL-limit.patch
+new file mode 100644
+index 0000000000..a9f9c8a35d
+--- /dev/null
++++ b/target/linux/qualcommax/patches-6.18/9900-clk-qcom-ipq8074-run-the-CPU-from-GPLL2-above-the-APSS-PLL-limit.patch
+@@ -0,0 +1,187 @@
++From: Myles Liu <lyx981mike@gmail.com>
++Subject: clk: qcom: ipq8074: run the CPU from GPLL2 above the APSS PLL's limit
++
++The 1.4 GHz IPQ807x bins (IPQ8174 and the like) have an APSS Huayra PLL
++that holds its multiplier at 73: whatever L is programmed above that, the
++PLL runs at 73 x 19.2 = 1401.6 MHz (its debug status, TEST_CTL[7:6] = 3,
++reads back L = 73, and the A53 cycle counter agrees). The clamp is inside
++the PLL; neither voltage nor any APSS register changes it.
++
++GCC's GPLL2, otherwise only an SDCC clock source, reaches the APSS mux as
++source 2 and has no such limit: the cores run at exactly the GPLL2 rate,
++2208 MHz included.
++
++When the device tree names a "gpll2" clock for the APCS block:
++- rates above 1401.6 MHz are taken from GPLL2, all others from the APSS
++  PLL as before;
++- the cores are parked on GPLL0 during every rate change (the notifier
++  IPQ53xx already uses), and return to whichever PLL the clock framework
++  chose;
++- GPLL2 changes rate through the alpha PLL update latch.
++
++Boards that do not name "gpll2" are unaffected.
++
++Signed-off-by: Myles Liu <lyx981mike@gmail.com>
++--- a/drivers/clk/qcom/apss-ipq6018.c	2026-11-15 19:29:31.873491576 -0800
+++++ b/drivers/clk/qcom/apss-ipq6018.c	2026-11-15 19:29:55.703701033 -0800
++@@ -10,6 +10,7 @@
++ #include <linux/regmap.h>
++ #include <linux/module.h>
++ #include <linux/clk.h>
+++#include <linux/of.h>
++ #include <linux/soc/qcom/smem.h>
++ 
++ #include <dt-bindings/clock/qcom,apss-ipq.h>
++@@ -25,18 +26,21 @@
++ 	P_XO,
++ 	P_GPLL0,
++ 	P_APSS_PLL_EARLY,
+++	P_GPLL2,
++ };
++ 
++ static const struct clk_parent_data parents_apcs_alias0_clk_src[] = {
++ 	{ .fw_name = "xo" },
++ 	{ .fw_name = "gpll0" },
++ 	{ .fw_name = "pll" },
+++	{ .fw_name = "gpll2" },
++ };
++ 
++ static const struct parent_map parents_apcs_alias0_clk_src_map[] = {
++ 	{ P_XO, 0 },
++ 	{ P_GPLL0, 4 },
++ 	{ P_APSS_PLL_EARLY, 5 },
+++	{ P_GPLL2, 2 },
++ };
++ 
++ static struct clk_rcg2 apcs_alias0_clk_src = {
++@@ -87,21 +91,63 @@
++ 	.num_clks = ARRAY_SIZE(apss_ipq6018_clks),
++ };
++ 
+++/*
+++ * The 1.4 GHz IPQ807x bins (IPQ8174 and the like) have an APSS PLL that never
+++ * runs faster than 73 x 19.2 = 1401.6 MHz, whatever L is programmed: the
+++ * clamp is inside the PLL. GCC's GPLL2, normally only an SDCC clock source,
+++ * reaches this mux as source 2 and has no such limit. When the device tree
+++ * hands GPLL2 in (clock-names "gpll2"), rates above the APSS PLL's limit are
+++ * taken from GPLL2 and everything else from the APSS PLL as before.
+++ */
+++#define APSS_PLL_MAX_RATE	1401600000UL
+++
+++static bool apss_gpll2_boost;
+++static struct clk_ops apcs_alias0_boost_ops;
+++
+++static int apcs_alias0_boost_determine_rate(struct clk_hw *hw,
+++					    struct clk_rate_request *req)
+++{
+++	struct clk_rate_request parent_req;
+++	struct clk_hw *parent;
+++	int ret;
+++
+++	parent = clk_hw_get_parent_by_index(hw, req->rate > APSS_PLL_MAX_RATE ?
+++					    P_GPLL2 : P_APSS_PLL_EARLY);
+++	if (!parent)
+++		return -EINVAL;
+++
+++	clk_hw_forward_rate_request(hw, req, parent, &parent_req, req->rate);
+++	ret = __clk_determine_rate(parent, &parent_req);
+++	if (ret)
+++		return ret;
+++
+++	req->best_parent_hw = parent;
+++	req->best_parent_rate = parent_req.rate;
+++	req->rate = parent_req.rate;
+++
+++	return 0;
+++}
+++
++ static int cpu_clk_notifier_fn(struct notifier_block *nb, unsigned long action,
++ 				void *data)
++ {
++-	struct clk_hw *hw;
+++	struct clk_hw *hw = &apcs_alias0_clk_src.clkr.hw;
++ 	u8 index;
++ 	int err;
++ 
+++	/*
+++	 * Run from GPLL0 while a PLL changes rate; afterwards return to the
+++	 * parent the clock framework has chosen (the APSS PLL, or GPLL2 for
+++	 * a boost rate).
+++	 */
++ 	if (action == PRE_RATE_CHANGE)
++ 		index = P_GPLL0;
++ 	else if (action == POST_RATE_CHANGE || action == ABORT_RATE_CHANGE)
++-		index = P_APSS_PLL_EARLY;
+++		index = apss_gpll2_boost ? clk_hw_get_parent_index(hw) :
+++					   P_APSS_PLL_EARLY;
++ 	else
++ 		return NOTIFY_OK;
++ 
++-	hw = &apcs_alias0_clk_src.clkr.hw;
++ 	err = clk_rcg2_mux_closest_ops.set_parent(hw, index);
++ 
++ 	return notifier_from_errno(err);
++@@ -111,7 +157,9 @@
++ {
++ 	struct clk_hw *hw = &apcs_alias0_clk_src.clkr.hw;
++ 	struct notifier_block *cpu_clk_notifier;
+++	struct device_node *np;
++ 	struct regmap *regmap;
+++	bool scaling = false;
++ 	u32 soc_id;
++ 	int ret;
++ 
++@@ -123,6 +171,17 @@
++ 	if (!regmap)
++ 		return -ENODEV;
++ 
+++	np = pdev->dev.of_node ?: pdev->dev.parent->of_node;
+++	if (np && of_property_match_string(np, "clock-names", "gpll2") >= 0) {
+++		apss_gpll2_boost = true;
+++		apcs_alias0_boost_ops = clk_rcg2_mux_closest_ops;
+++		apcs_alias0_boost_ops.determine_rate = apcs_alias0_boost_determine_rate;
+++		((struct clk_init_data *)apcs_alias0_clk_src.clkr.hw.init)->ops =
+++			&apcs_alias0_boost_ops;
+++		dev_info(&pdev->dev, "CPU rates above %lu Hz from GPLL2\n",
+++			 APSS_PLL_MAX_RATE);
+++	}
+++
++ 	ret = qcom_cc_really_probe(&pdev->dev, &apss_ipq6018_desc, regmap);
++ 	if (ret)
++ 		return ret;
++@@ -132,6 +191,14 @@
++ 	case QCOM_ID_IPQ5332:
++ 	case QCOM_ID_IPQ5322:
++ 	case QCOM_ID_IPQ5300:
+++		scaling = true;
+++		break;
+++	default:
+++		scaling = apss_gpll2_boost;
+++		break;
+++	}
+++
+++	if (scaling) {
++ 		cpu_clk_notifier = devm_kzalloc(&pdev->dev,
++ 						sizeof(*cpu_clk_notifier),
++ 						GFP_KERNEL);
++@@ -143,9 +210,6 @@
++ 		ret = devm_clk_notifier_register(&pdev->dev, hw->clk, cpu_clk_notifier);
++ 		if (ret)
++ 			return ret;
++-		break;
++-	default:
++-		break;
++ 	}
++ 
++ 	return 0;
++--- a/drivers/clk/qcom/gcc-ipq8074.c	2026-11-15 19:29:31.873491576 -0800
+++++ b/drivers/clk/qcom/gcc-ipq8074.c	2026-11-15 19:29:55.703701033 -0800
++@@ -94,6 +94,8 @@
++ static struct clk_alpha_pll gpll2_main = {
++ 	.offset = 0x4a000,
++ 	.regs = clk_alpha_pll_regs[CLK_ALPHA_PLL_TYPE_DEFAULT],
+++	/* Also a CPU clock source (apss-ipq6018.c): latch rate changes. */
+++	.flags = SUPPORTS_DYNAMIC_UPDATE,
++ 	.clkr = {
++ 		.enable_reg = 0x0b000,
++ 		.enable_mask = BIT(2),
+diff --git a/target/linux/qualcommax/patches-6.18/9901-cpufreq-let-schedutil-reach-boost-frequencies.patch b/target/linux/qualcommax/patches-6.18/9901-cpufreq-let-schedutil-reach-boost-frequencies.patch
+new file mode 100644
+index 0000000000..cf5d157ae1
+--- /dev/null
++++ b/target/linux/qualcommax/patches-6.18/9901-cpufreq-let-schedutil-reach-boost-frequencies.patch
+@@ -0,0 +1,56 @@
++From: Myles Liu <lyx981mike@gmail.com>
++Subject: cpufreq: let schedutil reach boost frequencies
++
++schedutil maps full utilization to the CPUs' reference frequency, which
++arch_topology (init_cpu_capacity_callback) takes from cpuinfo.max_freq
++once, when the cpufreq policy is created. With boost off at that moment the
++reference stays at the highest non-boost frequency, and enabling boost
++later makes the boost frequencies selectable by hand but never by
++schedutil: a fully busy CPU still asks for the old maximum.
++
++When software boost changes cpuinfo.max_freq, move the reference along,
++for the CPUs whose reference was taken from it.
++
++Signed-off-by: Myles Liu <lyx981mike@gmail.com>
++--- a/drivers/cpufreq/cpufreq.c	2026-11-15 19:56:46.466996596 -0800
+++++ b/drivers/cpufreq/cpufreq.c	2026-11-15 19:56:46.486996755 -0800
++@@ -14,6 +14,7 @@
++ 
++ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++ 
+++#include <linux/arch_topology.h>
++ #include <linux/cpu.h>
++ #include <linux/cpufreq.h>
++ #include <linux/cpu_cooling.h>
++@@ -2782,6 +2783,7 @@
++  *********************************************************************/
++ int cpufreq_boost_set_sw(struct cpufreq_policy *policy, int state)
++ {
+++	unsigned int old_max = policy->cpuinfo.max_freq;
++ 	int ret;
++ 
++ 	if (!policy->freq_table)
++@@ -2793,6 +2795,23 @@
++ 		return ret;
++ 	}
++ 
+++#ifdef CONFIG_GENERIC_ARCH_TOPOLOGY
+++	/*
+++	 * schedutil maps full utilization to the CPUs' reference frequency,
+++	 * which arch_topology takes from cpuinfo.max_freq once, when the policy
+++	 * is created. Where it did, follow the boost state; otherwise the
+++	 * boost frequencies stay out of schedutil's reach.
+++	 */
+++	{
+++		int cpu;
+++
+++		for_each_cpu(cpu, policy->related_cpus)
+++			if (per_cpu(capacity_freq_ref, cpu) == old_max)
+++				per_cpu(capacity_freq_ref, cpu) =
+++					policy->cpuinfo.max_freq;
+++	}
+++#endif
+++
++ 	ret = freq_qos_update_request(policy->max_freq_req, policy->max);
++ 	if (ret < 0)
++ 		return ret;

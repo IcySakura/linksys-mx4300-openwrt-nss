@@ -1,0 +1,224 @@
+#!/bin/sh
+# mx4300-cpu-oc - CPU overclocking for the Linksys MX4300. Off by default.
+#
+#   mx4300-cpu-oc status            JSON: settings, speeds, temperature, test
+#   mx4300-cpu-oc apply             apply /etc/config/mx4300-cpu-oc now
+#   mx4300-cpu-oc test [SECS] [KHZ] stability test (default 300 s at the
+#                                   configured maximum), detached
+#   mx4300-cpu-oc crash-check       run at boot: turn overclocking off if the
+#                                   previous boot ended in a crash
+#
+# The IPQ8174's own CPU PLL stops at 1401.6 MHz. The firmware's kernel takes
+# faster speeds from the SoC's GPLL2 instead (apss-ipq6018.c); those speeds
+# are cpufreq "boost" operating points, which the kernel leaves unused until
+# /sys/devices/system/cpu/cpufreq/boost is 1. Voltages come from CPR, the
+# SoC's closed-loop voltage controller, exactly as for the stock speeds.
+
+. /lib/functions.sh
+. /usr/share/libubox/jshn.sh
+
+CONFIG=mx4300-cpu-oc
+POLICY=/sys/devices/system/cpu/cpufreq/policy0
+BOOST=/sys/devices/system/cpu/cpufreq/boost
+STOCK_MAX=1382400
+STRESS=/usr/libexec/mx4300-cpu-oc-stress
+WORK=/tmp/mx4300-cpu-oc
+TEST=$WORK/test
+PSTORE=/sys/fs/pstore
+
+die() {
+	echo "mx4300-cpu-oc: $*" >&2
+	exit 1
+}
+
+load() {
+	config_load $CONFIG
+	config_get_bool ENABLED main enabled 0
+	config_get MAX_FREQ main max_freq 1843200
+	config_get REASON main disabled_reason ""
+}
+
+boost_freqs() {
+	cat $POLICY/scaling_boost_frequencies 2>/dev/null
+}
+
+stock_freqs() {
+	cat $POLICY/scaling_available_frequencies 2>/dev/null
+}
+
+cpu_temp() {
+	local z
+
+	for z in /sys/class/thermal/thermal_zone*; do
+		[ "$(cat $z/type 2>/dev/null)" = cluster-thermal ] && { cat $z/temp; return; }
+	done
+	cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null
+}
+
+# A speed is valid if the kernel offers it, stock or boost.
+valid_freq() {
+	case " $(stock_freqs) $(boost_freqs) " in *" $1 "*) return 0 ;; esac
+	return 1
+}
+
+set_limits() {	# max_khz boost(0|1)
+	if [ "$2" = 1 ]; then
+		[ -w $BOOST ] || die "this kernel has no boost operating points"
+		echo 1 > $BOOST
+		echo "$1" > $POLICY/scaling_max_freq
+	else
+		echo $STOCK_MAX > $POLICY/scaling_max_freq
+		[ -w $BOOST ] && echo 0 > $BOOST
+	fi
+}
+
+cmd_apply() {
+	load
+	if [ "$ENABLED" = 1 ] && [ "$MAX_FREQ" -gt $STOCK_MAX ] 2>/dev/null; then
+		valid_freq "$MAX_FREQ" || die "unsupported speed $MAX_FREQ kHz (have: $(stock_freqs) $(boost_freqs))"
+		set_limits "$MAX_FREQ" 1
+		logger -t mx4300-cpu-oc "overclocking on: up to $MAX_FREQ kHz"
+	else
+		set_limits $STOCK_MAX 0
+		[ "$ENABLED" = 1 ] || logger -t mx4300-cpu-oc "stock CPU speeds (up to $STOCK_MAX kHz)"
+	fi
+}
+
+disable() {	# reason
+	uci -q set $CONFIG.main.enabled=0
+	uci -q set $CONFIG.main.disabled_reason="$1"
+	uci -q commit $CONFIG
+	set_limits $STOCK_MAX 0
+	logger -t mx4300-cpu-oc "overclocking turned off: $1"
+}
+
+# The previous boot crashed if the kernel left a panic/oops record, or if its
+# console log stops without the kernel's own "reboot:" line (a hang the
+# watchdog reset). A power cut leaves nothing behind and does not count.
+cmd_crash_check() {
+	local last
+
+	load
+	[ "$ENABLED" = 1 ] || return 0
+	grep -q ' /sys/fs/pstore ' /proc/mounts || mount -t pstore pstore $PSTORE 2>/dev/null
+	if ls $PSTORE/dmesg-ramoops-* >/dev/null 2>&1; then
+		disable "The router crashed (kernel panic) while overclocked. Overclocking was turned off; consider a lower maximum speed."
+	elif [ -s $PSTORE/console-ramoops-0 ]; then
+		last=$(grep -v '^\s*$' $PSTORE/console-ramoops-0 | tail -n 1)
+		case "$last" in
+		*"reboot: Restarting system"*|*"reboot: Power down"*|*"reboot: System halted"*) ;;
+		*) disable "The router stopped responding and was restarted while overclocked. Overclocking was turned off; consider a lower maximum speed." ;;
+		esac
+	fi
+}
+
+test_get() {
+	[ -s $TEST.json ] && cat $TEST.json || echo '{ "state": "none" }'
+}
+
+test_put() {	# state khz secs [errors] [max_temp] [text]
+	json_init
+	json_add_string state "$1"
+	json_add_int khz "$2"
+	json_add_int seconds "$3"
+	[ -n "$4" ] && json_add_int errors "$4"
+	[ -n "$5" ] && json_add_int max_temp "$5"
+	[ -n "$6" ] && json_add_string text "$6"
+	json_add_int time "$(date +%s)"
+	mkdir -p $WORK
+	json_dump > $TEST.json.part && mv $TEST.json.part $TEST.json
+	[ "$1" = running ] || cp $TEST.json /etc/mx4300-cpu-oc.lasttest 2>/dev/null
+}
+
+# Pin the CPU at KHZ for SECS seconds under a CPU + memory stress load and
+# check every result. Errors turn overclocking off.
+cmd_test_run() {
+	local secs=$1 khz=$2 errors temp t maxt=0 boost_was min_was max_was
+
+	boost_was=$(cat $BOOST 2>/dev/null || echo 0)
+	min_was=$(cat $POLICY/scaling_min_freq)
+	max_was=$(cat $POLICY/scaling_max_freq)
+	[ "$khz" -gt $STOCK_MAX ] && echo 1 > $BOOST
+	echo "$khz" > $POLICY/scaling_max_freq
+	echo "$khz" > $POLICY/scaling_min_freq
+	logger -t mx4300-cpu-oc "stability test: $secs s at $khz kHz"
+	test_put running "$khz" "$secs"
+
+	$STRESS all 128 4 "$secs" > $TEST.log 2>&1 &
+	while kill -0 $! 2>/dev/null; do
+		t=$(cpu_temp)
+		[ "${t:-0}" -gt $maxt ] && maxt=$t
+		sleep 2
+	done
+	wait $!
+	errors=$(grep -c '^ERROR' $TEST.log)
+
+	echo "$min_was" > $POLICY/scaling_min_freq
+	echo "$boost_was" > $BOOST 2>/dev/null
+	echo "$max_was" > $POLICY/scaling_max_freq
+
+	if [ "$errors" = 0 ] && grep -q '^DONE' $TEST.log; then
+		test_put passed "$khz" "$secs" 0 "$maxt" "$(grep '^DONE' $TEST.log | sed 's/^DONE //')"
+		logger -t mx4300-cpu-oc "stability test passed at $khz kHz"
+	else
+		test_put failed "$khz" "$secs" "$errors" "$maxt" "$(grep -m1 '^ERROR' $TEST.log)"
+		load
+		[ "$ENABLED" = 1 ] && [ "$MAX_FREQ" -ge "$khz" ] &&
+			disable "The stability test at $((khz / 1000)) MHz found $errors calculation errors. Overclocking was turned off; choose a lower maximum speed."
+		logger -t mx4300-cpu-oc "stability test FAILED at $khz kHz ($errors errors)"
+	fi
+}
+
+cmd_test() {
+	local secs=${1:-300} khz=$2
+
+	load
+	[ -n "$khz" ] || khz=$MAX_FREQ
+	case "$secs" in *[!0-9]*|'') die "bad duration: $secs" ;; esac
+	[ "$secs" -ge 10 ] && [ "$secs" -le 3600 ] || die "duration must be 10-3600 s"
+	valid_freq "$khz" || die "unsupported speed $khz kHz"
+	[ "$(test_get | jsonfilter -e '@.state')" = running ] && die "a test is already running"
+	mkdir -p $WORK
+	rm -f $WORK/test.pid
+	start-stop-daemon -S -b -m -p $WORK/test.pid -x /bin/sh -- "$0" test-run "$secs" "$khz" ||
+		die "could not start the test"
+	echo "started"
+}
+
+cmd_status() {
+	local f last s
+
+	load
+	json_init
+	json_add_boolean enabled "$ENABLED"
+	json_add_int max_freq "$MAX_FREQ"
+	json_add_int stock_max "$STOCK_MAX"
+	json_add_string disabled_reason "$REASON"
+	json_add_boolean boost "$(cat $BOOST 2>/dev/null || echo 0)"
+	json_add_int cur_freq "$(cat $POLICY/scaling_cur_freq)"
+	json_add_int limit_freq "$(cat $POLICY/scaling_max_freq)"
+	json_add_int temp "$(cpu_temp)"
+	json_add_array stock_freqs
+	for f in $(stock_freqs); do json_add_int "" "$f"; done
+	json_close_array
+	json_add_array boost_freqs
+	for f in $(boost_freqs); do json_add_int "" "$f"; done
+	json_close_array
+	s=$(json_dump)
+	last=$(test_get)
+	[ "$(echo "$last" | jsonfilter -e '@.state')" = none ] && [ -s /etc/mx4300-cpu-oc.lasttest ] &&
+		last=$(cat /etc/mx4300-cpu-oc.lasttest)
+	echo "${s% \}}, \"test\": $last }"
+}
+
+cmd=$1
+[ $# -gt 0 ] && shift
+case "$cmd" in
+	status)		cmd_status ;;
+	apply)		cmd_apply ;;
+	test)		cmd_test "$@" ;;
+	test-run)	cmd_test_run "$@" ;;
+	test-status)	test_get ;;
+	crash-check)	cmd_crash_check ;;
+	*)		sed -n '2,11s/^# \{0,1\}//p' "$0"; exit 1 ;;
+esac

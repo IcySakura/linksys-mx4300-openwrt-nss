@@ -1,0 +1,23 @@
+#!/bin/sh /etc/rc.common
+# CPU overclocking (see /usr/sbin/mx4300-cpu-oc). Runs right after "boot"
+# (START=10, which mounts pstore) and before pstore-archive-style services
+# clear the crash records it reads.
+START=10
+USE_PROCD=1
+
+boot() {
+	/usr/sbin/mx4300-cpu-oc crash-check
+	start "$@"
+}
+
+start_service() {
+	/usr/sbin/mx4300-cpu-oc apply
+}
+
+reload_service() {
+	/usr/sbin/mx4300-cpu-oc apply
+}
+
+service_triggers() {
+	procd_add_reload_trigger mx4300-cpu-oc
+}

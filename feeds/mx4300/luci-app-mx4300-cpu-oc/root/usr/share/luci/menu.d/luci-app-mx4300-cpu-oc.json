@@ -1,0 +1,13 @@
+{
+	"admin/system/mx4300-cpu-oc": {
+		"title": "CPU Overclock",
+		"order": 76,
+		"action": {
+			"type": "view",
+			"path": "mx4300-cpu-oc"
+		},
+		"depends": {
+			"acl": [ "luci-app-mx4300-cpu-oc" ]
+		}
+	}
+}
