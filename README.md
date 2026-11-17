@@ -60,6 +60,12 @@ published images from, and adds:
   stability test, and a return to the last tested settings after a crash. See
   [docs/cpu-overclock.md](docs/cpu-overclock.md) for the findings,
   measurements and risks.
+- **Kernel AES on the CPU's crypto instructions** (`patches/0003`): the
+  kernel's AES-CBC/CTR/XTS, AES-GCM and AES-CCM use the ARMv8 Crypto
+  Extensions instead of generic C (AES-CBC 9.1 instead of 0.45 Gbit/s per
+  core). Helps kernel crypto users such as IPsec and WPA3 management frame
+  protection; programs with their own crypto (Xray, OpenSSL) already use
+  the instructions.
 
 ## How booting works
 
@@ -417,7 +423,8 @@ upstream/openwrt.conf      pinned upstream tree (URL, commit, upstream builder r
 upstream/feeds.conf        pinned feeds and the branches they follow
 upstream/third-party.conf  third-party sources (feeds and single packages)
 patches/                   changes to the upstream tree (0001: boot counter hold;
-                           0002: CPU overclocking kernel and device tree changes)
+                           0002: CPU overclocking kernel and device tree changes;
+                           0003: kernel AES on the CPU's crypto instructions)
 patches/feeds/FEED/        changes to a feed (sqm-scripts with the PPE shaper)
 configs/mx4300-nss.config  base build configuration (diffconfig)
 overlays/common/           files in every image (default theme switch)
