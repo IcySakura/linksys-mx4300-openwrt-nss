@@ -1,0 +1,2219 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Myles Liu <lyx981mike@gmail.com>
+Date: Thu, 26 Nov 2026 13:35:20 -0800
+Subject: [PATCH] nss-wifi-drv: add inline IPsec offload on Core 1 via XFRM and
+ C2C
+
+---
+ .../nss-wifi-drv/files/nss-wifi.flowtable     |   13 +-
+ .../kernel/nss-wifi-drv/files/nss-wifi.init   |   11 +
+ package/kernel/nss-wifi-drv/src/Makefile      |    6 +-
+ package/kernel/nss-wifi-drv/src/nss_core.c    |   34 +-
+ package/kernel/nss-wifi-drv/src/nss_flow.c    |   45 +-
+ package/kernel/nss-wifi-drv/src/nss_fw.h      |    5 +
+ package/kernel/nss-wifi-drv/src/nss_ipsec.c   | 1809 +++++++++++++++++
+ package/kernel/nss-wifi-drv/src/nss_ipsec.h   |   41 +
+ package/kernel/nss-wifi-drv/src/nss_msg.c     |    9 +-
+ package/kernel/nss-wifi-drv/src/nss_ring.c    |    5 +-
+ 10 files changed, 1963 insertions(+), 15 deletions(-)
+ create mode 100644 package/kernel/nss-wifi-drv/src/nss_ipsec.c
+ create mode 100644 package/kernel/nss-wifi-drv/src/nss_ipsec.h
+
+diff --git a/package/kernel/nss-wifi-drv/files/nss-wifi.flowtable b/package/kernel/nss-wifi-drv/files/nss-wifi.flowtable
+index e5a8dac4ab..b47ac438b9 100644
+--- a/package/kernel/nss-wifi-drv/files/nss-wifi.flowtable
++++ b/package/kernel/nss-wifi-drv/files/nss-wifi.flowtable
+@@ -20,7 +20,18 @@ esac
+ 
+ for dev in $(ubus call network.interface dump 2>/dev/null |
+ 	     jsonfilter -e '@.interface[@.up=true].l3_device' | sort -u); do
+-	[ "$(cat "/sys/class/net/$dev/type" 2>/dev/null)" = 519 ] || continue
++	type=$(cat "/sys/class/net/$dev/type" 2>/dev/null)
++	case "$type" in
++	519) ;;
++	65534)
++		# Include L3 XFRM tunnel devices (e.g. xfrm0) for Core 1 IPsec offload.
++		grep -qs '^DEVTYPE=xfrm$' "/sys/class/net/$dev/uevent" 2>/dev/null ||
++			ubus call network.interface dump 2>/dev/null |
++			jsonfilter -e '@.interface[@.up=true && @.proto="xfrm"].l3_device' |
++			grep -qx "$dev" || continue
++		;;
++	*) continue ;;
++	esac
+ 	case "$ft" in
+ 	*"\"$dev\""*) continue ;;
+ 	esac
+diff --git a/package/kernel/nss-wifi-drv/files/nss-wifi.init b/package/kernel/nss-wifi-drv/files/nss-wifi.init
+index 4be37341d6..d159d9e57f 100755
+--- a/package/kernel/nss-wifi-drv/files/nss-wifi.init
++++ b/package/kernel/nss-wifi-drv/files/nss-wifi.init
+@@ -130,6 +130,17 @@ start_service() {
+ 		return 0
+ 	}
+ 
++	# Opt-in Core 1 bring-up (EIP-197 + inline IPsec offload via C2C).
++	# Never blocks Wi-Fi offload on Core 0 if Core 1 is absent or fails.
++	if [ "$(uci -q get nss-wifi.general.core1)" = "1" ] &&
++	   [ -w /sys/kernel/debug/39400000.nss/boot ]; then
++		if echo 1 > /sys/kernel/debug/39400000.nss/boot 2>/dev/null; then
++			logger -t nss-wifi "core 1 booted (EIP-197 / IPsec offload)"
++		else
++			logger -t nss-wifi "core 1 boot failed, continuing with core 0 only"
++		fi
++	fi
++
+ 	# Cleared only once the board has been up long enough to have survived
+ 	# the bring-up, not when the core reports itself started: a hang
+ 	# arrives after that, and clearing before it turns one bad boot into
+diff --git a/package/kernel/nss-wifi-drv/src/Makefile b/package/kernel/nss-wifi-drv/src/Makefile
+index 13f156d63d..927fb8e1c1 100644
+--- a/package/kernel/nss-wifi-drv/src/Makefile
++++ b/package/kernel/nss-wifi-drv/src/Makefile
+@@ -1,8 +1,8 @@
+ obj-m += nss-wifi-drv.o
+ 
+-nss-wifi-drv-objs := nss_bridge.o nss_core.o nss_crypto.o nss_flow.o nss_mc.o \
+-		     nss_meminfo.o nss_mesh.o nss_msg.o nss_phys.o \
+-		     nss_redir.o nss_ring.o nss_wifili.o
++nss-wifi-drv-objs := nss_bridge.o nss_core.o nss_crypto.o nss_flow.o \
++		     nss_ipsec.o nss_mc.o nss_meminfo.o nss_mesh.o nss_msg.o \
++		     nss_phys.o nss_redir.o nss_ring.o nss_wifili.o
+ 
+ ccflags-y += -I$(src)/include
+ ccflags-y += -DCONFIG_NSS_WIFI_DRV=1
+diff --git a/package/kernel/nss-wifi-drv/src/nss_core.c b/package/kernel/nss-wifi-drv/src/nss_core.c
+index a3ed74b67d..51bc186703 100644
+--- a/package/kernel/nss-wifi-drv/src/nss_core.c
++++ b/package/kernel/nss-wifi-drv/src/nss_core.c
+@@ -37,6 +37,7 @@
+ 
+ #include "nss_drv.h"
+ #include "nss_crypto.h"
++#include "nss_ipsec.h"
+ 
+ /* Core control registers, in the "nphys" range. */
+ #define NSS_CORE_RESET_CTRL		0x0004
+@@ -482,8 +483,10 @@ static void nss_core_halt(struct nss_core *core)
+ 	if (peer)
+ 		WRITE_ONCE(peer->c2c_ready, false);
+ 
+-	if (core->id == 1)
++	if (core->id == 1) {
++		nss_ipsec_stop(core);
+ 		nss_crypto_stop(core);
++	}
+ 
+ 	if (core->id == 0)
+ 		qca_ppe_fw_carrier_set(core->conduit, NULL);
+@@ -1181,8 +1184,8 @@ static void nss_core_restart(struct work_struct *work)
+ 			ret = nss_core_boot(core);
+ 	if (!ret && READ_ONCE(core->running)) {
+ 		nss_c2c_try_setup();
+-		if (core->id == 1)
+-			nss_crypto_start(core);
++		if (core->id == 1 && !nss_crypto_start(core))
++			nss_ipsec_start(core);
+ 	}
+ 	/* After a fault the radios' interfaces are registered with the dead
+ 	 * instance; after a WLAN reset they are about to register again.
+@@ -1234,8 +1237,8 @@ static int nss_boot_set(void *data, u64 val)
+ 
+ 	nss_c2c_try_setup();
+ 
+-	if (core->id == 1)
+-		nss_crypto_start(core);
++	if (core->id == 1 && !nss_crypto_start(core))
++		nss_ipsec_start(core);
+ 
+ 	if (core->id == 0) {
+ 		nss_phys_arm_ports(core);
+@@ -1597,6 +1600,13 @@ static int nss_crypto_show(struct seq_file *s, void *unused)
+ }
+ DEFINE_SHOW_ATTRIBUTE(nss_crypto);
+ 
++static int nss_ipsec_show(struct seq_file *s, void *unused)
++{
++	nss_ipsec_print(s);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(nss_ipsec);
++
+ static void nss_aux_clocks_put(void *data)
+ {
+ 	struct nss_core *core = data;
+@@ -1817,9 +1827,12 @@ static int nss_probe(struct platform_device *pdev)
+ 	debugfs_create_file("load", 0400, core->debugfs, core, &nss_load_fops);
+ 	debugfs_create_file("c2c", 0600, core->debugfs, core, &nss_c2c_fops);
+ 
+-	if (core->id == 1)
++	if (core->id == 1) {
+ 		debugfs_create_file("crypto", 0400, core->debugfs, core,
+ 				    &nss_crypto_fops);
++		debugfs_create_file("ipsec", 0400, core->debugfs, core,
++				    &nss_ipsec_fops);
++	}
+ 
+ 	if (core->id == 0) {
+ 		debugfs_create_file("wifili_start", 0400, core->debugfs, core,
+@@ -1910,12 +1923,18 @@ static int __init nss_module_init(void)
+ 	if (ret)
+ 		goto mc;
+ 
+-	ret = platform_driver_register(&nss_driver);
++	ret = nss_ipsec_init();
+ 	if (ret)
+ 		goto redir;
+ 
++	ret = platform_driver_register(&nss_driver);
++	if (ret)
++		goto ipsec;
++
+ 	return 0;
+ 
++ipsec:
++	nss_ipsec_exit();
+ redir:
+ 	nss_redir_exit();
+ mc:
+@@ -1930,6 +1949,7 @@ module_init(nss_module_init);
+ static void __exit nss_module_exit(void)
+ {
+ 	platform_driver_unregister(&nss_driver);
++	nss_ipsec_exit();
+ 	nss_redir_exit();
+ 	nss_wifili_me_exit();
+ 	nss_mesh_exit();
+diff --git a/package/kernel/nss-wifi-drv/src/nss_flow.c b/package/kernel/nss-wifi-drv/src/nss_flow.c
+index e002812f4f..8acd52c230 100644
+--- a/package/kernel/nss-wifi-drv/src/nss_flow.c
++++ b/package/kernel/nss-wifi-drv/src/nss_flow.c
+@@ -37,6 +37,7 @@
+ #include <net/pkt_cls.h>
+ 
+ #include "nss_drv.h"
++#include "nss_ipsec.h"
+ 
+ /* Clamp the priority to the range the egress queues express; a higher value
+  * selects no distinct queue. The shipped PPE flow back end bounds the same
+@@ -111,6 +112,7 @@ struct nss_flow_entry {
+ 	bool v6;
+ 	bool installed;
+ 	bool bridged;
++	bool ipsec;
+ 	struct nss_flow_pppoe *pppoe;
+ 	enum flow_offload_tuple_dir pppoe_dir;	/* the side that is PPPoE */
+ 	u64 lastused;
+@@ -284,6 +286,11 @@ int nss_flow_ifnum(struct nss_core *core, int ifindex, u32 *mtu)
+ 
+ 	guard(rcu)();
+ 
++	/* An offloaded XFRM tunnel routes through Core 1's IPsec inner node. */
++	i = nss_ipsec_ifnum(ifindex, mtu);
++	if (i >= 0)
++		return i;
++
+ 	/* A mesh device is bound to two nodes; flows go to the one that
+ 	 * builds the mesh header.
+ 	 */
+@@ -333,7 +340,8 @@ static bool nss_flow_is_wireless(int ifindex)
+  */
+ bool nss_flow_is_ours(int ifindex)
+ {
+-	return nss_flow_is_wireless(ifindex) || nss_redir_bound(ifindex);
++	return nss_flow_is_wireless(ifindex) || nss_redir_bound(ifindex) ||
++	       nss_ipsec_owns(ifindex);
+ }
+ 
+ /* Everything the firmware is told about one direction, out of that
+@@ -432,6 +440,20 @@ static int nss_flow_take_dir(struct nss_core *core, struct nss_flow_entry *e,
+ 			ether_addr_copy(eth.h_source, out->dev_addr);
+ 	}
+ 
++	/* An L3 XFRM device carries no link-layer address; supply a valid
++	 * locally administered placeholder for Core 0's rule check.
++	 */
++	if (!is_valid_ether_addr(eth.h_dest) && out &&
++	    nss_ipsec_owns(out->ifindex)) {
++		static const u8 xfrm_mac[ETH_ALEN] = {
++			0x02, 0x00, 0x00, 0x00, 0x00, 0x01
++		};
++
++		ether_addr_copy(eth.h_dest, xfrm_mac);
++		if (!is_valid_ether_addr(eth.h_source))
++			ether_addr_copy(eth.h_source, xfrm_mac);
++	}
++
+ 	if (!is_valid_ether_addr(eth.h_dest))
+ 		return nss_flow_reject_at(NSS_FLOW_REJECT_NO_MAC, -EOPNOTSUPP, f, 0);
+ 
+@@ -890,6 +912,11 @@ static int nss_flow_send_v6(struct nss_core *core, struct nss_flow_entry *e,
+ 
+ static void nss_flow_withdraw(struct nss_core *core, struct nss_flow_entry *e)
+ {
++	if (e->ipsec) {
++		nss_ipsec_flow_del(e->flow);
++		e->ipsec = false;
++	}
++
+ 	if (!e->installed)
+ 		return;
+ 
+@@ -1033,6 +1060,19 @@ static int nss_flow_replace(struct nss_core *core, struct flow_cls_offload *f)
+ 		goto drop;
+ 	}
+ 
++	if (nss_ipsec_owns(e->dir[FLOW_OFFLOAD_DIR_ORIGINAL].ifindex) ||
++	    nss_ipsec_owns(e->dir[FLOW_OFFLOAD_DIR_REPLY].ifindex)) {
++		ret = nss_ipsec_flow_add(e->flow, flow->ct, e->v6, e->protocol,
++					 e->dir[FLOW_OFFLOAD_DIR_ORIGINAL].ifindex,
++					 e->dir[FLOW_OFFLOAD_DIR_REPLY].ifindex);
++		if (ret) {
++			nss_flow_reject_at(NSS_FLOW_REJECT_FIRMWARE, ret, f,
++					   -ret);
++			goto drop;
++		}
++		e->ipsec = true;
++	}
++
+ 	ret = e->v6 ? nss_flow_send_v6(core, e, flow->ct, &fw_err) :
+ 		      nss_flow_send_v4(core, e, flow->ct, &fw_err);
+ 	if (ret) {
+@@ -1452,7 +1492,8 @@ static int nss_flow_indr_cb(struct net_device *dev, struct Qdisc *sch,
+ 			    void *type_data, void *data,
+ 			    void (*cleanup)(struct flow_block_cb *block_cb))
+ {
+-	if (!dev || type != TC_SETUP_FT || dev->type != ARPHRD_RAWIP)
++	if (!dev || type != TC_SETUP_FT ||
++	    (dev->type != ARPHRD_RAWIP && !nss_ipsec_is_xfrm_dev(dev)))
+ 		return -EOPNOTSUPP;
+ 
+ 	return nss_flow_block(dev, type_data, sch, data, cleanup);
+diff --git a/package/kernel/nss-wifi-drv/src/nss_fw.h b/package/kernel/nss-wifi-drv/src/nss_fw.h
+index 1b3759bd42..543d930838 100644
+--- a/package/kernel/nss-wifi-drv/src/nss_fw.h
++++ b/package/kernel/nss-wifi-drv/src/nss_fw.h
+@@ -66,6 +66,11 @@ enum nss_dynamic_interface_type {
+ 	NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_INTERNAL = 19,
+ 	NSS_DYNAMIC_INTERFACE_TYPE_GENERIC_REDIR_N2H = 32,
+ 	NSS_DYNAMIC_INTERFACE_TYPE_GENERIC_REDIR_H2N = 33,
++	NSS_DYNAMIC_INTERFACE_TYPE_IPSEC_CMN_INNER = 46,
++	NSS_DYNAMIC_INTERFACE_TYPE_IPSEC_CMN_MDATA_INNER = 47,
++	NSS_DYNAMIC_INTERFACE_TYPE_IPSEC_CMN_OUTER = 48,
++	NSS_DYNAMIC_INTERFACE_TYPE_IPSEC_CMN_MDATA_OUTER = 49,
++	NSS_DYNAMIC_INTERFACE_TYPE_IPSEC_CMN_REDIRECT = 50,
+ 	NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_EXTERNAL0 = 61,
+ 	NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_EXTERNAL1 = 62,
+ 	NSS_DYNAMIC_INTERFACE_TYPE_WIFI_MESH_INNER = 70,
+diff --git a/package/kernel/nss-wifi-drv/src/nss_ipsec.c b/package/kernel/nss-wifi-drv/src/nss_ipsec.c
+new file mode 100644
+index 0000000000..22842a0489
+--- /dev/null
++++ b/package/kernel/nss-wifi-drv/src/nss_ipsec.c
+@@ -0,0 +1,1809 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Inline IPsec offload on NSS Core 1 (nss_ipsec_cmn + EIP-197 + C2C).
++ *
++ * Bridges mainline Linux XFRM (via xfrm_register_km + xfrm_state_walk, zero
++ * kernel patches) to Core 1's nss_ipsec_cmn firmware node and Core 0's flow
++ * tables:
++ *   - Core 1 owns 100% of ESP sequence numbers and anti-replay windows for
++ *     offloaded tunnel-mode SAs (using mdata_inner lookaside for host /
++ *     first-packet outbound traffic and inline inner/outer nodes via C2C for
++ *     forwarded flows).
++ *   - Decrypted inner exceptions from Core 1 arrive on inner_if and are
++ *     injected into the bound xfrm netdev via netif_receive_skb().
++ *   - Inbound IKEv2 non-ESP exceptions (UDP-4500 SPI==0) on outer_if are
++ *     injected into the local WAN netdev; outbound encrypted exceptions are
++ *     routed via ip_local_out() / ip6_local_out().
++ *   - If Core 1 is halted or ipsec=0, all hooks are inactive and Linux's
++ *     native software XFRM (ARMv8 AES-CE) handles traffic transparently.
++ */
++
++#include <linux/cleanup.h>
++#include <linux/etherdevice.h>
++#include <linux/if_arp.h>
++#include <linux/in.h>
++#include <linux/in6.h>
++#include <linux/inetdevice.h>
++#include <linux/ip.h>
++#include <linux/ipv6.h>
++#include <linux/list.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/netdevice.h>
++#include <linux/netfilter.h>
++#include <linux/netfilter_ipv4.h>
++#include <linux/netfilter_ipv6.h>
++#include <linux/rcupdate.h>
++#include <linux/rtnetlink.h>
++#include <linux/seq_file.h>
++#include <linux/skbuff.h>
++#include <linux/udp.h>
++#include <linux/workqueue.h>
++#include <net/addrconf.h>
++#include <net/dst.h>
++#include <net/esp.h>
++#include <net/ip.h>
++#include <net/ip6_route.h>
++#include <net/neighbour.h>
++#include <net/netfilter/nf_conntrack.h>
++#include <net/route.h>
++#include <net/rtnetlink.h>
++#include <net/xfrm.h>
++
++#include "nss_drv.h"
++#include "nss_crypto.h"
++#include "nss_ipsec.h"
++
++static bool nss_ipsec_enable = true;
++module_param_named(ipsec, nss_ipsec_enable, bool, 0644);
++MODULE_PARM_DESC(ipsec, "enable inline IPsec offload on NSS Core 1");
++
++bool nss_ipsec_is_xfrm_dev(const struct net_device *dev)
++{
++	return dev && dev->type == ARPHRD_NONE && dev->rtnl_link_ops &&
++	       dev->rtnl_link_ops->kind &&
++	       !strcmp(dev->rtnl_link_ops->kind, "xfrm");
++}
++
++#if IS_ENABLED(CONFIG_XFRM)
++
++/* nss_ipsec_cmn wire protocol (matches firmware 12.5 nss_ipsec_cmn.h). */
++#define NSS_IPSEC_CMN_FLAG_IPV6		BIT(0)
++#define NSS_IPSEC_CMN_FLAG_IPV4_NATT	BIT(1)
++#define NSS_IPSEC_CMN_FLAG_ESP_ESN	BIT(3)
++#define NSS_IPSEC_CMN_FLAG_ESP_REPLAY	BIT(5)
++#define NSS_IPSEC_CMN_FLAG_CIPHER_GCM	BIT(7)
++#define NSS_IPSEC_CMN_FLAG_COPY_DSCP	BIT(8)
++#define NSS_IPSEC_CMN_FLAG_COPY_DF	BIT(9)
++
++#define NSS_IPSEC_CMN_MDATA_VERSION	0x01
++#define NSS_IPSEC_CMN_MDATA_MAGIC	0x8893
++#define NSS_IPSEC_CMN_MDATA_ORIGIN_HOST	0x01
++
++#define NSS_IPSEC_TX_HEADROOM		192
++#define NSS_IPSEC_TX_TAILROOM		128
++#define NSS_IPSEC_MAX_SA		64
++
++enum nss_ipsec_cmn_msg_type {
++	NSS_IPSEC_CMN_MSG_NODE_CONFIG	= 1,
++	NSS_IPSEC_CMN_MSG_CTX_CONFIG	= 2,
++	NSS_IPSEC_CMN_MSG_CTX_SYNC	= 3,
++	NSS_IPSEC_CMN_MSG_SA_CREATE	= 4,
++	NSS_IPSEC_CMN_MSG_SA_DESTROY	= 5,
++	NSS_IPSEC_CMN_MSG_SA_SYNC	= 6,
++	NSS_IPSEC_CMN_MSG_FLOW_CREATE	= 7,
++	NSS_IPSEC_CMN_MSG_FLOW_DESTROY	= 8,
++};
++
++enum nss_ipsec_cmn_ctx_type {
++	NSS_IPSEC_CMN_CTX_INNER		= 1,
++	NSS_IPSEC_CMN_CTX_MDATA_INNER	= 2,
++	NSS_IPSEC_CMN_CTX_OUTER		= 3,
++	NSS_IPSEC_CMN_CTX_MDATA_OUTER	= 4,
++};
++
++struct nss_ipsec_cmn_flow_tuple {
++	u32 dest_ip[4];
++	u32 src_ip[4];
++	u32 spi_index;
++	u16 dst_port;
++	u16 src_port;
++	u8 user_pattern;
++	u8 protocol;
++	u8 ip_ver;
++};
++
++struct nss_ipsec_cmn_sa_tuple {
++	u32 dest_ip[4];
++	u32 src_ip[4];
++	u32 spi_index;
++	u16 dest_port;
++	u16 src_port;
++	u16 crypto_index;
++	u8 protocol;
++	u8 ip_ver;
++	u8 hop_limit;
++	u8 res[3];
++};
++
++struct nss_ipsec_cmn_sa_data {
++	u32 seq_start;
++	u32 flags;
++	u16 window_size;
++	u8 dscp;
++	u8 df;
++	u8 blk_len;
++	u8 iv_len;
++	u8 icv_len;
++	u8 res1;
++	u32 res2[4];
++};
++
++struct nss_ipsec_cmn_flow {
++	struct nss_ipsec_cmn_flow_tuple flow_tuple;
++	struct nss_ipsec_cmn_sa_tuple sa_tuple;
++};
++
++struct nss_ipsec_cmn_sa {
++	struct nss_ipsec_cmn_sa_tuple sa_tuple;
++	struct nss_ipsec_cmn_sa_data sa_data;
++};
++
++struct nss_ipsec_cmn_ctx {
++	u32 type;
++	u32 except_ifnum;
++	u32 sibling_ifnum;
++};
++
++struct nss_ipsec_cmn_node {
++	u8 dma_redirect;
++	u8 dma_lookaside;
++	u16 max_sa;
++};
++
++struct nss_ipsec_cmn_ctx_stats {
++	struct nss_cmn_node_stats cmn_stats;
++	u32 exceptioned;
++	u32 linearized;
++	u32 redirected;
++	u32 dropped;
++	u32 fail_sa;
++	u32 fail_flow;
++	u32 fail_stats;
++	u32 fail_exception;
++	u32 fail_transform;
++	u32 fail_linearized;
++	u32 fail_mdata_ver;
++	u32 fail_ctx_active;
++	u32 fail_pbuf_crypto;
++	u32 fail_queue_crypto;
++};
++
++struct nss_ipsec_cmn_ctx_sync {
++	u32 type;
++	struct nss_ipsec_cmn_ctx_stats stats;
++};
++
++struct nss_ipsec_cmn_msg {
++	struct nss_cmn_msg cm;
++	union {
++		struct nss_ipsec_cmn_node node;
++		struct nss_ipsec_cmn_ctx ctx;
++		struct nss_ipsec_cmn_sa sa;
++		struct nss_ipsec_cmn_flow flow;
++		struct nss_ipsec_cmn_ctx_sync ctx_sync;
++	} msg;
++};
++
++struct nss_ipsec_cmn_mdata_cmn {
++	u8 version;
++	u8 origin;
++	u16 len;
++	u8 res[2];
++	u16 magic;
++};
++
++struct nss_ipsec_cmn_mdata_encap {
++	struct nss_ipsec_cmn_sa_tuple sa;
++	u32 seq_num;
++	u16 data_len;
++	u16 flags;
++};
++
++struct nss_ipsec_cmn_mdata {
++	struct nss_ipsec_cmn_mdata_cmn cm;
++	struct nss_ipsec_cmn_mdata_encap encap;
++};
++
++struct nss_ipsec_outer_rule {
++	struct list_head node;
++	u8 ip_ver;
++	u8 protocol;
++	u16 local_port;
++	u16 remote_port;
++	u32 local_ip[4];
++	u32 remote_ip[4];
++	u32 ref;
++	bool installed;
++};
++
++struct nss_ipsec_sa {
++	struct list_head node;
++	struct rcu_head rcu;
++	struct nss_ipsec_cmn_sa_tuple tuple;
++	struct nss_ipsec_cmn_sa_data data;
++	struct nss_ipsec_outer_rule *outer;
++	u32 if_id;
++	u16 crypto_idx;
++	bool decap;
++	bool seen;
++};
++
++/* Snapshot captured under xfrm_state_walk spinlock and processed outside it. */
++struct nss_ipsec_sa_spec {
++	struct nss_ipsec_cmn_sa_tuple tuple;
++	struct nss_ipsec_cmn_sa_data data;
++	enum nss_crypto_algo algo;
++	u8 cipher_key[NSS_CRYPTO_CIPHER_KEYLEN_MAX];
++	u16 cipher_keylen;
++	u8 auth_key[NSS_CRYPTO_AUTH_KEYLEN_MAX];
++	u16 auth_keylen;
++	u8 nonce[NSS_CRYPTO_NONCE_SIZE_MAX];
++	u16 nonce_len;
++	u32 if_id;
++	bool decap;
++};
++
++struct nss_ipsec_inner_flow {
++	struct list_head node;
++	unsigned long key;
++	struct nss_ipsec_cmn_flow_tuple flow_tuple;
++	struct nss_ipsec_cmn_sa_tuple sa_tuple;
++};
++
++struct nss_ipsec_state {
++	struct nss_core *core;
++	int inner_if;
++	int mdata_inner_if;
++	int outer_if;
++	int mdata_outer_if;
++	u32 inner_if_c1;
++	u32 outer_if_c1;
++	bool ready;
++	bool km_registered;
++	bool nf_registered;
++
++	struct net_device __rcu *xfrm_dev;
++	int xfrm_ifindex;
++
++	struct list_head sas;
++	struct list_head outer_rules;
++	struct list_head flows;
++	struct work_struct sync_work;
++
++	/* Firmware and host counters. */
++	u64 inner_tx_pkts;
++	u64 inner_tx_bytes;
++	u64 outer_rx_pkts;
++	u64 outer_rx_bytes;
++	u64 inner_except_rx;
++	u64 outer_except_rx;
++	u64 mdata_encap_tx;
++	u64 mdata_encap_drop;
++	u64 flow_creates;
++	u64 flow_destroys;
++	u64 outer_rules_pushed;
++};
++
++static DEFINE_MUTEX(nss_ipsec_lock);
++static struct nss_ipsec_state nss_ipsec = {
++	.inner_if = -1,
++	.mdata_inner_if = -1,
++	.outer_if = -1,
++	.mdata_outer_if = -1,
++};
++
++static bool nss_ipsec_sa_match(const struct nss_ipsec_cmn_sa_tuple *a,
++			       const struct nss_ipsec_cmn_sa_tuple *b)
++{
++	if (a->ip_ver != b->ip_ver || a->protocol != b->protocol ||
++	    a->spi_index != b->spi_index)
++		return false;
++	if (a->ip_ver == IPVERSION)
++		return a->src_ip[0] == b->src_ip[0] &&
++		       a->dest_ip[0] == b->dest_ip[0];
++	return !memcmp(a->src_ip, b->src_ip, sizeof(a->src_ip)) &&
++	       !memcmp(a->dest_ip, b->dest_ip, sizeof(a->dest_ip));
++}
++
++static int nss_ipsec_msg_send(struct nss_core *core, u32 if_num,
++			      enum nss_ipsec_cmn_msg_type type,
++			      struct nss_ipsec_cmn_msg *m, size_t body_len)
++{
++	m->cm.interface = if_num;
++	m->cm.type = type;
++
++	return nss_msg_send(core, m,
++			    offsetof(struct nss_ipsec_cmn_msg, msg) + body_len);
++}
++
++static int nss_ipsec_ctx_config(struct nss_core *core, int if_num,
++				enum nss_ipsec_cmn_ctx_type type,
++				int except_if, int sibling_if)
++{
++	struct nss_ipsec_cmn_msg m = {};
++
++	m.msg.ctx.type = type;
++	m.msg.ctx.except_ifnum = except_if;
++	m.msg.ctx.sibling_ifnum = sibling_if;
++
++	return nss_ipsec_msg_send(core, if_num, NSS_IPSEC_CMN_MSG_CTX_CONFIG,
++				  &m, sizeof(m.msg.ctx));
++}
++
++/* Map XFRM SA crypto parameters to an EIP-197 nss_crypto_cmn algorithm. */
++static bool nss_ipsec_parse_crypto(const struct xfrm_state *x,
++				   struct nss_ipsec_sa_spec *spec)
++{
++	if (x->aead) {
++		unsigned int kbytes = x->aead->alg_key_len / BITS_PER_BYTE;
++
++		if (strcmp(x->aead->alg_name, "rfc4106(gcm(aes))") ||
++		    kbytes <= 4)
++			return false;
++
++		spec->cipher_keylen = kbytes - 4;
++		switch (spec->cipher_keylen) {
++		case 16:
++			spec->algo = NSS_CRYPTO_ALGO_AES128_GCM_GMAC;
++			break;
++		case 24:
++			spec->algo = NSS_CRYPTO_ALGO_AES192_GCM_GMAC;
++			break;
++		case 32:
++			spec->algo = NSS_CRYPTO_ALGO_AES256_GCM_GMAC;
++			break;
++		default:
++			return false;
++		}
++		memcpy(spec->cipher_key, x->aead->alg_key, spec->cipher_keylen);
++		spec->nonce_len = 4;
++		memcpy(spec->nonce, x->aead->alg_key + spec->cipher_keylen, 4);
++		spec->data.blk_len = 16;
++		spec->data.iv_len = 8;
++		spec->data.icv_len = x->aead->alg_icv_len / BITS_PER_BYTE;
++		spec->data.flags |= NSS_IPSEC_CMN_FLAG_CIPHER_GCM;
++		return true;
++	}
++
++	if (x->ealg && x->aalg) {
++		unsigned int ek = x->ealg->alg_key_len / BITS_PER_BYTE;
++		unsigned int ak = x->aalg->alg_key_len / BITS_PER_BYTE;
++
++		if (ek > NSS_CRYPTO_CIPHER_KEYLEN_MAX ||
++		    ak > NSS_CRYPTO_AUTH_KEYLEN_MAX)
++			return false;
++
++		if (!strcmp(x->ealg->alg_name, "cbc(aes)")) {
++			if (!strcmp(x->aalg->alg_name, "hmac(sha1)")) {
++				spec->algo = ek == 16 ? NSS_CRYPTO_ALGO_AES128_CBC_SHA160_HMAC :
++					     ek == 24 ? NSS_CRYPTO_ALGO_AES192_CBC_SHA160_HMAC :
++					     ek == 32 ? NSS_CRYPTO_ALGO_AES256_CBC_SHA160_HMAC : 0;
++			} else if (!strcmp(x->aalg->alg_name, "hmac(sha256)")) {
++				spec->algo = ek == 16 ? NSS_CRYPTO_ALGO_AES128_CBC_SHA256_HMAC :
++					     ek == 24 ? NSS_CRYPTO_ALGO_AES192_CBC_SHA256_HMAC :
++					     ek == 32 ? NSS_CRYPTO_ALGO_AES256_CBC_SHA256_HMAC : 0;
++			} else if (!strcmp(x->aalg->alg_name, "hmac(sha384)")) {
++				spec->algo = ek == 16 ? NSS_CRYPTO_ALGO_AES128_CBC_SHA384_HMAC :
++					     ek == 24 ? NSS_CRYPTO_ALGO_AES192_CBC_SHA384_HMAC :
++					     ek == 32 ? NSS_CRYPTO_ALGO_AES256_CBC_SHA384_HMAC : 0;
++			} else if (!strcmp(x->aalg->alg_name, "hmac(sha512)")) {
++				spec->algo = ek == 16 ? NSS_CRYPTO_ALGO_AES128_CBC_SHA512_HMAC :
++					     ek == 24 ? NSS_CRYPTO_ALGO_AES192_CBC_SHA512_HMAC :
++					     ek == 32 ? NSS_CRYPTO_ALGO_AES256_CBC_SHA512_HMAC : 0;
++			} else {
++				return false;
++			}
++			spec->data.blk_len = 16;
++			spec->data.iv_len = 16;
++		} else if (!strcmp(x->ealg->alg_name, "cbc(des3_ede)") &&
++			   ek == 24) {
++			if (!strcmp(x->aalg->alg_name, "hmac(sha1)"))
++				spec->algo = NSS_CRYPTO_ALGO_3DES_CBC_SHA160_HMAC;
++			else if (!strcmp(x->aalg->alg_name, "hmac(sha256)"))
++				spec->algo = NSS_CRYPTO_ALGO_3DES_CBC_SHA256_HMAC;
++			else
++				return false;
++			spec->data.blk_len = 8;
++			spec->data.iv_len = 8;
++		} else {
++			return false;
++		}
++
++		if (!spec->algo)
++			return false;
++
++		spec->cipher_keylen = ek;
++		memcpy(spec->cipher_key, x->ealg->alg_key, ek);
++		spec->auth_keylen = ak;
++		memcpy(spec->auth_key, x->aalg->alg_key, ak);
++		spec->data.icv_len = x->aalg->alg_trunc_len / BITS_PER_BYTE;
++		return true;
++	}
++
++	return false;
++}
++
++static bool nss_ipsec_is_local_addr(u16 family, const xfrm_address_t *addr)
++{
++	guard(rcu)();
++
++	if (family == AF_INET)
++		return __ip_dev_find(&init_net, addr->a4, false) != NULL;
++
++	return ipv6_dev_find(&init_net, &addr->in6, NULL) != NULL;
++}
++
++struct nss_ipsec_walk_ctx {
++	struct nss_ipsec_sa_spec *specs;
++	u32 count;
++	u32 cap;
++};
++
++static int nss_ipsec_walk_cb(struct xfrm_state *x, int count, void *arg)
++{
++	struct nss_ipsec_walk_ctx *w = arg;
++	struct nss_ipsec_sa_spec *spec;
++	int i;
++
++	if (w->count >= w->cap)
++		return 0;
++	if (x->km.state != XFRM_STATE_VALID || x->id.proto != IPPROTO_ESP ||
++	    x->props.mode != XFRM_MODE_TUNNEL)
++		return 0;
++	if (x->props.family != AF_INET && x->props.family != AF_INET6)
++		return 0;
++	if (x->encap && x->encap->encap_type != UDP_ENCAP_ESPINUDP)
++		return 0;
++
++	spec = &w->specs[w->count];
++	memset(spec, 0, sizeof(*spec));
++
++	if (!nss_ipsec_parse_crypto(x, spec))
++		return 0;
++
++	spec->if_id = x->if_id;
++	spec->tuple.spi_index = ntohl(x->id.spi);
++	spec->tuple.protocol = IPPROTO_ESP;
++	if (x->encap) {
++		spec->tuple.protocol = IPPROTO_UDP;
++		spec->tuple.src_port = ntohs(x->encap->encap_sport);
++		spec->tuple.dest_port = ntohs(x->encap->encap_dport);
++		spec->data.flags |= NSS_IPSEC_CMN_FLAG_IPV4_NATT;
++	}
++
++	if (x->props.family == AF_INET) {
++		spec->tuple.ip_ver = IPVERSION;
++		spec->tuple.src_ip[0] = ntohl(x->props.saddr.a4);
++		spec->tuple.dest_ip[0] = ntohl(x->id.daddr.a4);
++	} else {
++		spec->tuple.ip_ver = 6;
++		for (i = 0; i < 4; i++) {
++			spec->tuple.src_ip[i] = ntohl(x->props.saddr.a6[i]);
++			spec->tuple.dest_ip[i] = ntohl(x->id.daddr.a6[i]);
++		}
++		spec->data.flags &= ~NSS_IPSEC_CMN_FLAG_IPV4_NATT;
++		spec->data.flags |= NSS_IPSEC_CMN_FLAG_IPV6;
++	}
++
++	spec->decap = nss_ipsec_is_local_addr(x->props.family, &x->id.daddr);
++	if (x->props.flags & XFRM_STATE_ESN)
++		spec->data.flags |= NSS_IPSEC_CMN_FLAG_ESP_ESN;
++
++	if (spec->decap) {
++		u32 rwin = x->replay_esn ? x->replay_esn->replay_window :
++					   x->props.replay_window;
++
++		if (rwin) {
++			spec->data.window_size = min_t(u32, rwin, 1024);
++			spec->data.flags |= NSS_IPSEC_CMN_FLAG_ESP_REPLAY;
++		}
++	} else {
++		spec->tuple.hop_limit = 64;
++		if (!(x->props.extra_flags & XFRM_SA_XFLAG_DONT_ENCAP_DSCP))
++			spec->data.flags |= NSS_IPSEC_CMN_FLAG_COPY_DSCP;
++		if (!(x->props.flags & XFRM_STATE_NOPMTUDISC))
++			spec->data.flags |= NSS_IPSEC_CMN_FLAG_COPY_DF;
++	}
++
++	w->count++;
++	return 0;
++}
++
++/* Install or remove a Core 0 outer rule steering WAN <-> Core 1 outer_if. */
++static int nss_ipsec_outer_push(struct nss_ipsec_outer_rule *r)
++{
++	struct nss_core *core0 = nss_core_get(0);
++	struct net_device *wan_dev;
++	struct neighbour *n;
++	u8 gw_mac[ETH_ALEN];
++	u32 wan_mtu = 0;
++	int wan_ifnum, ret;
++
++	if (!core0 || !READ_ONCE(core0->running) || !READ_ONCE(core0->c2c_ready))
++		return -ENODEV;
++
++	if (r->ip_ver == IPVERSION) {
++		struct nss_ipv4_msg *m __free(kfree) = NULL;
++		struct nss_ipv4_rule_create_msg *c;
++		struct rtable *rt;
++		__be32 daddr = htonl(r->remote_ip[0]);
++		__be32 saddr = htonl(r->local_ip[0]);
++
++		rt = ip_route_output(&init_net, daddr, saddr, 0, 0,
++				     RT_SCOPE_UNIVERSE);
++		if (IS_ERR(rt))
++			return PTR_ERR(rt);
++
++		wan_dev = rt->dst.dev;
++		wan_ifnum = nss_flow_ifnum(core0, wan_dev->ifindex, &wan_mtu);
++		if (wan_ifnum < 0) {
++			ip_rt_put(rt);
++			return wan_ifnum;
++		}
++
++		n = dst_neigh_lookup(&rt->dst, &daddr);
++		if (!n || !(n->nud_state & NUD_VALID)) {
++			if (n)
++				neigh_release(n);
++			ip_rt_put(rt);
++			return -EHOSTUNREACH;
++		}
++		ether_addr_copy(gw_mac, n->ha);
++		neigh_release(n);
++
++		m = kzalloc(sizeof(*m), GFP_KERNEL);
++		if (!m) {
++			ip_rt_put(rt);
++			return -ENOMEM;
++		}
++
++		c = &m->msg.rule_create;
++		c->tuple.protocol = r->protocol;
++		c->tuple.flow_ip = r->local_ip[0];
++		c->tuple.flow_ident = r->local_port;
++		c->tuple.return_ip = r->remote_ip[0];
++		c->tuple.return_ident = r->remote_port;
++
++		c->conn_rule.flow_ip_xlate = r->local_ip[0];
++		c->conn_rule.flow_ident_xlate = r->local_port;
++		c->conn_rule.return_ip_xlate = r->remote_ip[0];
++		c->conn_rule.return_ident_xlate = r->remote_port;
++		memcpy(c->conn_rule.flow_mac, wan_dev->dev_addr, ETH_ALEN);
++		memcpy(c->conn_rule.return_mac, gw_mac, ETH_ALEN);
++		c->conn_rule.flow_interface_num = nss_ipsec.outer_if_c1;
++		c->conn_rule.return_interface_num = wan_ifnum;
++		c->conn_rule.flow_mtu = NSS_IPSEC_INNER_MTU;
++		c->conn_rule.return_mtu = wan_mtu;
++		c->nexthop_rule.flow_nexthop = nss_ipsec.outer_if_c1;
++		c->nexthop_rule.return_nexthop = wan_ifnum;
++		c->vlan_primary_rule.ingress_vlan_tag = 0xfff;
++		c->vlan_primary_rule.egress_vlan_tag = 0xfff;
++		c->vlan_secondary_rule.ingress_vlan_tag = 0xfff;
++		c->vlan_secondary_rule.egress_vlan_tag = 0xfff;
++		c->rule_flags = NSS_IPV4_RULE_CREATE_FLAG_ROUTED;
++		c->valid_flags = NSS_IPV4_RULE_CREATE_CONN_VALID |
++				 NSS_IPV4_RULE_CREATE_QOS_VALID |
++				 NSS_IPV4_RULE_CREATE_NEXTHOP_VALID;
++
++		ip_rt_put(rt);
++
++		m->cm.interface = NSS_INTERFACE_IPV4;
++		m->cm.type = NSS_IPV4_TX_CREATE_RULE_MSG;
++		ret = nss_msg_send(core0, m,
++				   offsetof(struct nss_ipv4_msg, msg) +
++				   sizeof(*c));
++		if (!ret) {
++			r->installed = true;
++			nss_ipsec.outer_rules_pushed++;
++		}
++		return ret;
++	}
++
++	/* IPv6 outer rule. */
++	{
++		struct nss_ipv6_msg *m __free(kfree) = NULL;
++		struct nss_ipv6_rule_create_msg *c;
++		struct flowi6 fl6 = {};
++		struct dst_entry *dst;
++		int i;
++
++		for (i = 0; i < 4; i++) {
++			fl6.saddr.s6_addr32[i] = htonl(r->local_ip[i]);
++			fl6.daddr.s6_addr32[i] = htonl(r->remote_ip[i]);
++		}
++		dst = ip6_route_output(&init_net, NULL, &fl6);
++		if (IS_ERR(dst))
++			return PTR_ERR(dst);
++
++		wan_dev = dst->dev;
++		wan_ifnum = nss_flow_ifnum(core0, wan_dev->ifindex, &wan_mtu);
++		if (wan_ifnum < 0) {
++			dst_release(dst);
++			return wan_ifnum;
++		}
++
++		n = dst_neigh_lookup(dst, &fl6.daddr);
++		if (!n || !(n->nud_state & NUD_VALID)) {
++			if (n)
++				neigh_release(n);
++			dst_release(dst);
++			return -EHOSTUNREACH;
++		}
++		ether_addr_copy(gw_mac, n->ha);
++		neigh_release(n);
++
++		m = kzalloc(sizeof(*m), GFP_KERNEL);
++		if (!m) {
++			dst_release(dst);
++			return -ENOMEM;
++		}
++
++		c = &m->msg.rule_create;
++		c->tuple.protocol = r->protocol;
++		memcpy(c->tuple.flow_ip, r->local_ip, sizeof(c->tuple.flow_ip));
++		c->tuple.flow_ident = r->local_port;
++		memcpy(c->tuple.return_ip, r->remote_ip,
++		       sizeof(c->tuple.return_ip));
++		c->tuple.return_ident = r->remote_port;
++		memcpy(c->conn_rule.flow_mac, wan_dev->dev_addr, ETH_ALEN);
++		memcpy(c->conn_rule.return_mac, gw_mac, ETH_ALEN);
++		c->conn_rule.flow_interface_num = nss_ipsec.outer_if_c1;
++		c->conn_rule.return_interface_num = wan_ifnum;
++		c->conn_rule.flow_mtu = NSS_IPSEC_INNER_MTU;
++		c->conn_rule.return_mtu = wan_mtu;
++		c->nexthop_rule.flow_nexthop = nss_ipsec.outer_if_c1;
++		c->nexthop_rule.return_nexthop = wan_ifnum;
++		c->vlan_primary_rule.ingress_vlan_tag = 0xfff;
++		c->vlan_primary_rule.egress_vlan_tag = 0xfff;
++		c->vlan_secondary_rule.ingress_vlan_tag = 0xfff;
++		c->vlan_secondary_rule.egress_vlan_tag = 0xfff;
++		c->rule_flags = NSS_IPV6_RULE_CREATE_FLAG_ROUTED;
++		c->valid_flags = NSS_IPV6_RULE_CREATE_CONN_VALID |
++				 NSS_IPV6_RULE_CREATE_QOS_VALID |
++				 NSS_IPV6_RULE_CREATE_NEXTHOP_VALID;
++
++		dst_release(dst);
++
++		m->cm.interface = NSS_INTERFACE_IPV6;
++		m->cm.type = NSS_IPV6_TX_CREATE_RULE_MSG;
++		ret = nss_msg_send(core0, m,
++				   offsetof(struct nss_ipv6_msg, msg) +
++				   sizeof(*c));
++		if (!ret) {
++			r->installed = true;
++			nss_ipsec.outer_rules_pushed++;
++		}
++		return ret;
++	}
++}
++
++static void nss_ipsec_outer_pull(struct nss_ipsec_outer_rule *r)
++{
++	struct nss_core *core0 = nss_core_get(0);
++
++	if (!r->installed || !core0 || !READ_ONCE(core0->running)) {
++		r->installed = false;
++		return;
++	}
++
++	if (r->ip_ver == IPVERSION) {
++		struct nss_ipv4_msg *m __free(kfree) =
++			kzalloc(sizeof(*m), GFP_KERNEL);
++
++		if (m) {
++			m->cm.interface = NSS_INTERFACE_IPV4;
++			m->cm.type = NSS_IPV4_TX_DESTROY_RULE_MSG;
++			m->msg.rule_destroy.tuple.protocol = r->protocol;
++			m->msg.rule_destroy.tuple.flow_ip = r->local_ip[0];
++			m->msg.rule_destroy.tuple.flow_ident = r->local_port;
++			m->msg.rule_destroy.tuple.return_ip = r->remote_ip[0];
++			m->msg.rule_destroy.tuple.return_ident = r->remote_port;
++			nss_msg_send_quiet(core0, m,
++					   offsetof(struct nss_ipv4_msg, msg) +
++					   sizeof(m->msg.rule_destroy));
++		}
++	} else {
++		struct nss_ipv6_msg *m __free(kfree) =
++			kzalloc(sizeof(*m), GFP_KERNEL);
++
++		if (m) {
++			m->cm.interface = NSS_INTERFACE_IPV6;
++			m->cm.type = NSS_IPV6_TX_DESTROY_RULE_MSG;
++			m->msg.rule_destroy.tuple.protocol = r->protocol;
++			memcpy(m->msg.rule_destroy.tuple.flow_ip, r->local_ip,
++			       sizeof(r->local_ip));
++			m->msg.rule_destroy.tuple.flow_ident = r->local_port;
++			memcpy(m->msg.rule_destroy.tuple.return_ip,
++			       r->remote_ip, sizeof(r->remote_ip));
++			m->msg.rule_destroy.tuple.return_ident = r->remote_port;
++			nss_msg_send_quiet(core0, m,
++					   offsetof(struct nss_ipv6_msg, msg) +
++					   sizeof(m->msg.rule_destroy));
++		}
++	}
++
++	r->installed = false;
++}
++
++static struct nss_ipsec_outer_rule *
++nss_ipsec_outer_hold(const struct nss_ipsec_sa_spec *spec)
++{
++	struct nss_ipsec_outer_rule *r;
++	u32 local_ip[4], remote_ip[4];
++	u16 local_port, remote_port;
++
++	if (spec->decap) {
++		memcpy(local_ip, spec->tuple.dest_ip, sizeof(local_ip));
++		memcpy(remote_ip, spec->tuple.src_ip, sizeof(remote_ip));
++		local_port = spec->tuple.dest_port;
++		remote_port = spec->tuple.src_port;
++	} else {
++		memcpy(local_ip, spec->tuple.src_ip, sizeof(local_ip));
++		memcpy(remote_ip, spec->tuple.dest_ip, sizeof(remote_ip));
++		local_port = spec->tuple.src_port;
++		remote_port = spec->tuple.dest_port;
++	}
++
++	list_for_each_entry(r, &nss_ipsec.outer_rules, node) {
++		if (r->ip_ver == spec->tuple.ip_ver &&
++		    r->protocol == spec->tuple.protocol &&
++		    r->local_port == local_port &&
++		    r->remote_port == remote_port &&
++		    !memcmp(r->local_ip, local_ip, sizeof(local_ip)) &&
++		    !memcmp(r->remote_ip, remote_ip, sizeof(remote_ip))) {
++			r->ref++;
++			if (!r->installed)
++				nss_ipsec_outer_push(r);
++			return r;
++		}
++	}
++
++	r = kzalloc(sizeof(*r), GFP_KERNEL);
++	if (!r)
++		return NULL;
++
++	r->ip_ver = spec->tuple.ip_ver;
++	r->protocol = spec->tuple.protocol;
++	r->local_port = local_port;
++	r->remote_port = remote_port;
++	memcpy(r->local_ip, local_ip, sizeof(local_ip));
++	memcpy(r->remote_ip, remote_ip, sizeof(remote_ip));
++	r->ref = 1;
++	list_add_tail(&r->node, &nss_ipsec.outer_rules);
++	nss_ipsec_outer_push(r);
++
++	return r;
++}
++
++static void nss_ipsec_outer_drop(struct nss_ipsec_outer_rule *r)
++{
++	if (!r || --r->ref)
++		return;
++
++	nss_ipsec_outer_pull(r);
++	list_del(&r->node);
++	kfree(r);
++}
++
++static int nss_ipsec_sa_install(const struct nss_ipsec_sa_spec *spec)
++{
++	struct nss_core *core = nss_ipsec.core;
++	struct nss_crypto_ctx_cfg ccfg = {
++		.algo = spec->algo,
++		.cipher_key = spec->cipher_key,
++		.cipher_keylen = spec->cipher_keylen,
++		.auth_key = spec->auth_key,
++		.auth_keylen = spec->auth_keylen,
++		.nonce = spec->nonce,
++		.nonce_len = spec->nonce_len,
++	};
++	struct nss_ipsec_cmn_msg *m __free(kfree) = NULL;
++	struct nss_ipsec_sa *sa;
++	u16 crypto_idx;
++	int if_num, ret;
++
++	ret = nss_crypto_ctx_alloc(&ccfg, &crypto_idx);
++	if (ret)
++		return ret;
++
++	sa = kzalloc(sizeof(*sa), GFP_KERNEL);
++	m = kzalloc(sizeof(*m), GFP_KERNEL);
++	if (!sa || !m) {
++		kfree(sa);
++		nss_crypto_ctx_free(crypto_idx);
++		return -ENOMEM;
++	}
++
++	sa->tuple = spec->tuple;
++	sa->tuple.crypto_index = crypto_idx;
++	sa->data = spec->data;
++	sa->if_id = spec->if_id;
++	sa->crypto_idx = crypto_idx;
++	sa->decap = spec->decap;
++	sa->seen = true;
++
++	if_num = sa->decap ? nss_ipsec.outer_if : nss_ipsec.inner_if;
++	m->msg.sa.sa_tuple = sa->tuple;
++	m->msg.sa.sa_data = sa->data;
++
++	ret = nss_ipsec_msg_send(core, if_num, NSS_IPSEC_CMN_MSG_SA_CREATE,
++				 m, sizeof(m->msg.sa));
++	if (ret) {
++		dev_warn(core->dev,
++			 "ipsec: SA_CREATE %s spi %#x failed: %d (err %u)\n",
++			 sa->decap ? "decap" : "encap",
++			 sa->tuple.spi_index, ret, m->cm.error);
++		kfree(sa);
++		nss_crypto_ctx_free(crypto_idx);
++		return ret;
++	}
++
++	/* Decap SAs need a matching outer flow entry on Core 1 outer_if so
++	 * incoming ESP/UDP-4500 packets match the SA by (src, dst, spi, proto).
++	 */
++	if (sa->decap) {
++		memset(m, 0, sizeof(*m));
++		memcpy(m->msg.flow.flow_tuple.dest_ip, sa->tuple.dest_ip,
++		       sizeof(sa->tuple.dest_ip));
++		memcpy(m->msg.flow.flow_tuple.src_ip, sa->tuple.src_ip,
++		       sizeof(sa->tuple.src_ip));
++		m->msg.flow.flow_tuple.spi_index = sa->tuple.spi_index;
++		m->msg.flow.flow_tuple.dst_port = sa->tuple.dest_port;
++		m->msg.flow.flow_tuple.src_port = sa->tuple.src_port;
++		m->msg.flow.flow_tuple.protocol = sa->tuple.protocol;
++		m->msg.flow.flow_tuple.ip_ver = sa->tuple.ip_ver;
++		m->msg.flow.sa_tuple = sa->tuple;
++		nss_ipsec_msg_send(core, if_num, NSS_IPSEC_CMN_MSG_FLOW_CREATE,
++				   m, sizeof(m->msg.flow));
++	}
++
++	sa->outer = nss_ipsec_outer_hold(spec);
++	list_add_tail_rcu(&sa->node, &nss_ipsec.sas);
++
++	dev_info(core->dev,
++		 "ipsec: offloaded %s SA spi %#x proto %u v%u crypto %u\n",
++		 sa->decap ? "decap" : "encap", sa->tuple.spi_index,
++		 sa->tuple.protocol, sa->tuple.ip_ver, sa->crypto_idx);
++	return 0;
++}
++
++static void nss_ipsec_sa_remove(struct nss_ipsec_sa *sa)
++{
++	struct nss_core *core = nss_ipsec.core;
++	struct nss_ipsec_cmn_msg *m __free(kfree) = NULL;
++	int if_num = sa->decap ? nss_ipsec.outer_if : nss_ipsec.inner_if;
++
++	list_del_rcu(&sa->node);
++	synchronize_rcu();
++
++	nss_ipsec_outer_drop(sa->outer);
++
++	if (core && READ_ONCE(core->running) && nss_ipsec.ready) {
++		m = kzalloc(sizeof(*m), GFP_KERNEL);
++		if (m) {
++			if (sa->decap) {
++				memcpy(m->msg.flow.flow_tuple.dest_ip,
++				       sa->tuple.dest_ip,
++				       sizeof(sa->tuple.dest_ip));
++				memcpy(m->msg.flow.flow_tuple.src_ip,
++				       sa->tuple.src_ip,
++				       sizeof(sa->tuple.src_ip));
++				m->msg.flow.flow_tuple.spi_index =
++					sa->tuple.spi_index;
++				m->msg.flow.flow_tuple.dst_port =
++					sa->tuple.dest_port;
++				m->msg.flow.flow_tuple.src_port =
++					sa->tuple.src_port;
++				m->msg.flow.flow_tuple.protocol =
++					sa->tuple.protocol;
++				m->msg.flow.flow_tuple.ip_ver =
++					sa->tuple.ip_ver;
++				m->msg.flow.sa_tuple = sa->tuple;
++				nss_ipsec_msg_send(core, if_num,
++						   NSS_IPSEC_CMN_MSG_FLOW_DESTROY,
++						   m, sizeof(m->msg.flow));
++				memset(m, 0, sizeof(*m));
++			}
++
++			m->msg.sa.sa_tuple = sa->tuple;
++			nss_ipsec_msg_send(core, if_num,
++					   NSS_IPSEC_CMN_MSG_SA_DESTROY,
++					   m, sizeof(m->msg.sa));
++		}
++	}
++
++	nss_crypto_ctx_free(sa->crypto_idx);
++	kfree_rcu(sa, rcu);
++}
++
++static void nss_ipsec_reconcile(struct work_struct *work)
++{
++	struct nss_ipsec_walk_ctx w = { .cap = NSS_IPSEC_MAX_SA };
++	struct xfrm_state_walk walk;
++	struct nss_ipsec_sa *sa, *tmp;
++	u32 i;
++
++	guard(mutex)(&nss_ipsec_lock);
++
++	if (!nss_ipsec.ready || !nss_ipsec.core || !nss_ipsec.core->running)
++		return;
++
++	w.specs = kvcalloc(w.cap, sizeof(*w.specs), GFP_KERNEL);
++	if (!w.specs)
++		return;
++
++	xfrm_state_walk_init(&walk, IPPROTO_ESP, NULL);
++	xfrm_state_walk(&init_net, &walk, nss_ipsec_walk_cb, &w);
++	xfrm_state_walk_done(&walk, &init_net);
++
++	list_for_each_entry(sa, &nss_ipsec.sas, node)
++		sa->seen = false;
++
++	for (i = 0; i < w.count; i++) {
++		bool found = false;
++
++		list_for_each_entry(sa, &nss_ipsec.sas, node) {
++			if (sa->decap == w.specs[i].decap &&
++			    nss_ipsec_sa_match(&sa->tuple, &w.specs[i].tuple)) {
++				sa->seen = true;
++				if (sa->outer && !sa->outer->installed)
++					nss_ipsec_outer_push(sa->outer);
++				found = true;
++				break;
++			}
++		}
++
++		if (!found)
++			nss_ipsec_sa_install(&w.specs[i]);
++	}
++
++	list_for_each_entry_safe(sa, tmp, &nss_ipsec.sas, node)
++		if (!sa->seen)
++			nss_ipsec_sa_remove(sa);
++
++	kvfree(w.specs);
++}
++
++static int nss_ipsec_km_notify(struct xfrm_state *x, const struct km_event *c)
++{
++	if (!READ_ONCE(nss_ipsec.ready))
++		return 0;
++
++	switch (c->event) {
++	case XFRM_MSG_NEWSA:
++	case XFRM_MSG_UPDSA:
++	case XFRM_MSG_DELSA:
++	case XFRM_MSG_EXPIRE:
++	case XFRM_MSG_FLUSHSA:
++		schedule_work(&nss_ipsec.sync_work);
++		break;
++	}
++
++	return 0;
++}
++
++static int nss_ipsec_km_new_mapping(struct xfrm_state *x,
++				    xfrm_address_t *ipaddr, __be16 sport)
++{
++	if (READ_ONCE(nss_ipsec.ready))
++		schedule_work(&nss_ipsec.sync_work);
++
++	return 0;
++}
++
++static struct xfrm_mgr nss_ipsec_km = {
++	.notify = nss_ipsec_km_notify,
++	.new_mapping = nss_ipsec_km_new_mapping,
++};
++
++/* Resolve the offloaded encap SA for an inner flow via Linux XFRM policy. */
++static bool nss_ipsec_lookup_encap_sa(const struct flowi *fl,
++				      struct dst_entry *dst_orig,
++				      struct nss_ipsec_cmn_sa_tuple *out)
++{
++	u32 tried[4] = {};
++	int ntried = 0;
++	struct nss_ipsec_sa *sa;
++
++	guard(rcu)();
++
++	list_for_each_entry_rcu(sa, &nss_ipsec.sas, node) {
++		struct dst_entry *xdst;
++		struct xfrm_state *x;
++		bool dup = false;
++		u32 spi;
++		int i;
++
++		if (sa->decap)
++			continue;
++
++		for (i = 0; i < ntried; i++)
++			if (tried[i] == sa->if_id)
++				dup = true;
++		if (dup)
++			continue;
++		if (ntried < ARRAY_SIZE(tried))
++			tried[ntried++] = sa->if_id;
++
++		dst_hold(dst_orig);
++		xdst = xfrm_lookup_with_ifid(&init_net, dst_orig, fl, NULL,
++					     0, sa->if_id);
++		if (IS_ERR(xdst))
++			continue;
++
++		x = xdst->xfrm;
++		if (x && x->id.proto == IPPROTO_ESP) {
++			struct nss_ipsec_sa *cand;
++
++			spi = ntohl(x->id.spi);
++			list_for_each_entry_rcu(cand, &nss_ipsec.sas, node) {
++				if (!cand->decap &&
++				    cand->tuple.spi_index == spi &&
++				    cand->if_id == x->if_id) {
++					*out = cand->tuple;
++					dst_release(xdst);
++					return true;
++				}
++			}
++		}
++		dst_release(xdst);
++	}
++
++	return false;
++}
++
++/* Host/slow-path outbound packets leaving xfrm0 are sent through Core 1's
++ * mdata_inner_if so Core 1 owns 100% of ESP sequence numbers for offloaded SAs.
++ */
++static unsigned int nss_ipsec_postrouting(void *priv, struct sk_buff *skb,
++					  const struct nf_hook_state *state)
++{
++	struct nss_core *core = READ_ONCE(nss_ipsec.core);
++	struct nss_ipsec_cmn_sa_tuple sa_tuple;
++	struct nss_ipsec_cmn_mdata *mdata;
++	struct dst_entry *dst;
++	struct flowi fl = {};
++	u16 data_len;
++	int mdata_if;
++
++	if (!READ_ONCE(nss_ipsec.ready) || !core || !READ_ONCE(core->running))
++		return NF_ACCEPT;
++	if (!state->out || state->out->ifindex != READ_ONCE(nss_ipsec.xfrm_ifindex))
++		return NF_ACCEPT;
++
++	dst = skb_dst(skb);
++	if (!dst)
++		return NF_ACCEPT;
++
++	if (state->pf == NFPROTO_IPV4) {
++		const struct iphdr *iph = ip_hdr(skb);
++
++		fl.u.ip4.saddr = iph->saddr;
++		fl.u.ip4.daddr = iph->daddr;
++		fl.u.ip4.flowi4_proto = iph->protocol;
++		fl.u.ip4.flowi4_oif = state->out->ifindex;
++	} else if (state->pf == NFPROTO_IPV6) {
++		const struct ipv6hdr *ip6h = ipv6_hdr(skb);
++
++		fl.u.ip6.saddr = ip6h->saddr;
++		fl.u.ip6.daddr = ip6h->daddr;
++		fl.u.ip6.flowi6_proto = ip6h->nexthdr;
++		fl.u.ip6.flowi6_oif = state->out->ifindex;
++	} else {
++		return NF_ACCEPT;
++	}
++
++	if (!nss_ipsec_lookup_encap_sa(&fl, dst, &sa_tuple))
++		return NF_ACCEPT;
++
++	if (skb_is_gso(skb))
++		return NF_ACCEPT;
++
++	if (skb->ip_summed == CHECKSUM_PARTIAL && skb_checksum_help(skb))
++		return NF_DROP;
++
++	if (skb_linearize(skb)) {
++		nss_ipsec.mdata_encap_drop++;
++		return NF_DROP;
++	}
++
++	if (skb_cloned(skb) || skb_headroom(skb) < NSS_IPSEC_TX_HEADROOM ||
++	    skb_tailroom(skb) < NSS_IPSEC_TX_TAILROOM) {
++		if (pskb_expand_head(skb, NSS_IPSEC_TX_HEADROOM,
++				     NSS_IPSEC_TX_TAILROOM, GFP_ATOMIC)) {
++			nss_ipsec.mdata_encap_drop++;
++			return NF_DROP;
++		}
++	}
++
++	data_len = skb->len;
++	skb_put(skb, NSS_IPSEC_TX_TAILROOM);
++
++	/* Align metadata start to 4 bytes, matching nss_ipsecmgr_tunnel_push_mdata(). */
++	{
++		u8 *data = skb->data;
++		u8 *mo_ptr = PTR_ALIGN(data - (sizeof(*mdata) + sizeof(u32)),
++				       sizeof(u32));
++		u16 mlen = data - mo_ptr;
++
++		mdata = skb_push(skb, mlen);
++		memset(mdata, 0, mlen);
++		mdata->cm.version = NSS_IPSEC_CMN_MDATA_VERSION;
++		mdata->cm.origin = NSS_IPSEC_CMN_MDATA_ORIGIN_HOST;
++		mdata->cm.len = mlen;
++		mdata->cm.magic = NSS_IPSEC_CMN_MDATA_MAGIC;
++		mdata->encap.sa = sa_tuple;
++		mdata->encap.data_len = data_len;
++	}
++
++	skb_scrub_packet(skb, true);
++
++	mdata_if = READ_ONCE(nss_ipsec.mdata_inner_if);
++	if (mdata_if < 0 || nss_data_send(core, skb, mdata_if, 0)) {
++		nss_ipsec.mdata_encap_drop++;
++		kfree_skb(skb);
++		return NF_STOLEN;
++	}
++
++	nss_ipsec.mdata_encap_tx++;
++	return NF_STOLEN;
++}
++
++static const struct nf_hook_ops nss_ipsec_nf_ops[] = {
++	{
++		.hook = nss_ipsec_postrouting,
++		.pf = NFPROTO_IPV4,
++		.hooknum = NF_INET_POST_ROUTING,
++		.priority = NF_IP_PRI_LAST,
++	},
++	{
++		.hook = nss_ipsec_postrouting,
++		.pf = NFPROTO_IPV6,
++		.hooknum = NF_INET_POST_ROUTING,
++		.priority = NF_IP6_PRI_LAST,
++	},
++};
++
++/* Core 1 exception receive handler (decrypted inner or outer ESP/IKEv2). */
++bool nss_ipsec_recv(struct nss_core *core, struct napi_struct *napi,
++		    const struct n2h_descriptor *desc, struct sk_buff *skb)
++{
++	u32 end = (u32)desc->payload_offs + desc->payload_len;
++	int ifn = desc->interface_num;
++	bool is_inner, is_outer;
++	u8 ver;
++
++	if (core->id != 1 || desc->buffer_type != NSS_N2H_BUFFER_PACKET ||
++	    !READ_ONCE(nss_ipsec.ready))
++		return false;
++
++	is_inner = (ifn == READ_ONCE(nss_ipsec.inner_if) ||
++		    ifn == READ_ONCE(nss_ipsec.mdata_inner_if));
++	is_outer = (ifn == READ_ONCE(nss_ipsec.outer_if) ||
++		    ifn == READ_ONCE(nss_ipsec.mdata_outer_if));
++	if (!is_inner && !is_outer)
++		return false;
++
++	dma_unmap_single(core->dev, desc->buffer, NSS_EMPTY_BUFFER_ALLOC,
++			 DMA_FROM_DEVICE);
++
++	if (end > NSS_EMPTY_BUFFER_ALLOC || desc->payload_len < sizeof(struct iphdr)) {
++		dev_kfree_skb_any(skb);
++		return true;
++	}
++
++	skb_reserve(skb, desc->payload_offs);
++	skb_put(skb, desc->payload_len);
++	skb_reset_mac_header(skb);
++	skb_reset_network_header(skb);
++	ver = ip_hdr(skb)->version;
++
++	if (ver != IPVERSION && ver != 6) {
++		dev_kfree_skb_any(skb);
++		return true;
++	}
++
++	skb->protocol = (ver == IPVERSION) ? htons(ETH_P_IP) : htons(ETH_P_IPV6);
++	skb->ip_summed = CHECKSUM_UNNECESSARY;
++
++	if (is_inner) {
++		struct net_device *xdev;
++
++		nss_ipsec.inner_except_rx++;
++		rcu_read_lock();
++		xdev = rcu_dereference(nss_ipsec.xfrm_dev);
++		if (!xdev) {
++			rcu_read_unlock();
++			dev_kfree_skb_any(skb);
++			return true;
++		}
++		skb->dev = xdev;
++		skb->pkt_type = PACKET_HOST;
++		skb->skb_iif = xdev->ifindex;
++		dev_sw_netstats_rx_add(xdev, skb->len);
++		netif_receive_skb(skb);
++		rcu_read_unlock();
++		return true;
++	}
++
++	/* Outer exception: either inbound (e.g. UDP-4500 IKEv2 SPI==0) or
++	 * outbound encrypted ESP that missed Core 0's outer rule.
++	 */
++	nss_ipsec.outer_except_rx++;
++
++	if (ver == IPVERSION) {
++		struct iphdr *iph = ip_hdr(skb);
++		struct net_device *ldev;
++		struct rtable *rt;
++
++		rcu_read_lock();
++		ldev = __ip_dev_find(&init_net, iph->daddr, false);
++		if (ldev) {
++			skb->dev = ldev;
++			skb->pkt_type = PACKET_HOST;
++			skb->skb_iif = ldev->ifindex;
++			netif_receive_skb(skb);
++			rcu_read_unlock();
++			return true;
++		}
++		rcu_read_unlock();
++
++		rt = ip_route_output(&init_net, iph->daddr, iph->saddr, 0, 0,
++				     RT_SCOPE_UNIVERSE);
++		if (IS_ERR(rt)) {
++			dev_kfree_skb_any(skb);
++			return true;
++		}
++		skb_dst_set(skb, &rt->dst);
++		ip_local_out(&init_net, NULL, skb);
++		return true;
++	}
++
++	/* IPv6 outer exception. */
++	{
++		struct ipv6hdr *ip6h = ipv6_hdr(skb);
++		struct net_device *ldev;
++		struct flowi6 fl6 = {};
++		struct dst_entry *dst;
++
++		rcu_read_lock();
++		ldev = ipv6_dev_find(&init_net, &ip6h->daddr, NULL);
++		if (ldev) {
++			skb->dev = ldev;
++			skb->pkt_type = PACKET_HOST;
++			skb->skb_iif = ldev->ifindex;
++			netif_receive_skb(skb);
++			rcu_read_unlock();
++			return true;
++		}
++		rcu_read_unlock();
++
++		fl6.saddr = ip6h->saddr;
++		fl6.daddr = ip6h->daddr;
++		dst = ip6_route_output(&init_net, NULL, &fl6);
++		if (IS_ERR(dst)) {
++			dev_kfree_skb_any(skb);
++			return true;
++		}
++		skb_dst_set(skb, dst);
++		ip6_local_out(&init_net, NULL, skb);
++		return true;
++	}
++}
++
++void nss_ipsec_notify(struct nss_core *core, const struct nss_cmn_msg *ncm,
++		      u32 len)
++{
++	const struct nss_ipsec_cmn_msg *m;
++	u32 iface;
++
++	if (core->id != 1 || ncm->type != NSS_IPSEC_CMN_MSG_CTX_SYNC ||
++	    len < offsetofend(struct nss_ipsec_cmn_msg, msg.ctx_sync))
++		return;
++
++	iface = NSS_INTERFACE_NUM_GET(ncm->interface);
++	m = container_of_const(ncm, struct nss_ipsec_cmn_msg, cm);
++
++	if (iface == nss_ipsec.inner_if || iface == nss_ipsec.mdata_inner_if) {
++		nss_ipsec.inner_tx_pkts += m->msg.ctx_sync.stats.cmn_stats.tx_packets;
++		nss_ipsec.inner_tx_bytes += m->msg.ctx_sync.stats.cmn_stats.tx_bytes;
++	} else if (iface == nss_ipsec.outer_if || iface == nss_ipsec.mdata_outer_if) {
++		nss_ipsec.outer_rx_pkts += m->msg.ctx_sync.stats.cmn_stats.rx_packets;
++		nss_ipsec.outer_rx_bytes += m->msg.ctx_sync.stats.cmn_stats.rx_bytes;
++	}
++}
++
++bool nss_ipsec_owns(int ifindex)
++{
++	return READ_ONCE(nss_ipsec.ready) && ifindex > 0 &&
++	       READ_ONCE(nss_ipsec.xfrm_ifindex) == ifindex;
++}
++
++int nss_ipsec_ifnum(int ifindex, u32 *mtu)
++{
++	if (!nss_ipsec_owns(ifindex))
++		return -ENODEV;
++
++	*mtu = NSS_IPSEC_INNER_MTU;
++	return READ_ONCE(nss_ipsec.inner_if_c1);
++}
++
++static bool nss_ipsec_build_inner_flow(struct nf_conn *ct, bool v6, u8 protocol,
++				       int orig_ifindex, int reply_ifindex,
++				       struct nss_ipsec_cmn_flow_tuple *ft,
++				       struct nss_ipsec_cmn_sa_tuple *st)
++{
++	const struct nf_conntrack_tuple *t;
++	struct dst_entry *dst;
++	struct flowi fl = {};
++	int i;
++
++	/* Select the direction going OUT toward xfrm0 (to be encapsulated). */
++	if (nss_ipsec_owns(reply_ifindex))
++		t = &ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple;
++	else if (nss_ipsec_owns(orig_ifindex))
++		t = &ct->tuplehash[IP_CT_DIR_REPLY].tuple;
++	else
++		return false;
++
++	memset(ft, 0, sizeof(*ft));
++	ft->protocol = protocol;
++	ft->src_port = ntohs(t->src.u.all);
++	ft->dst_port = ntohs(t->dst.u.all);
++
++	if (!v6) {
++		struct rtable *rt;
++
++		ft->ip_ver = IPVERSION;
++		ft->src_ip[0] = ntohl(t->src.u3.ip);
++		ft->dest_ip[0] = ntohl(t->dst.u3.ip);
++
++		fl.u.ip4.saddr = t->src.u3.ip;
++		fl.u.ip4.daddr = t->dst.u3.ip;
++		fl.u.ip4.flowi4_proto = protocol;
++		fl.u.ip4.flowi4_oif = READ_ONCE(nss_ipsec.xfrm_ifindex);
++
++		rt = ip_route_output(&init_net, t->dst.u3.ip, t->src.u3.ip,
++				     0, fl.u.ip4.flowi4_oif,
++				     RT_SCOPE_UNIVERSE);
++		if (IS_ERR(rt))
++			return false;
++		dst = &rt->dst;
++	} else {
++		ft->ip_ver = 6;
++		for (i = 0; i < 4; i++) {
++			ft->src_ip[i] = ntohl(t->src.u3.ip6[i]);
++			ft->dest_ip[i] = ntohl(t->dst.u3.ip6[i]);
++		}
++
++		fl.u.ip6.saddr = t->src.u3.in6;
++		fl.u.ip6.daddr = t->dst.u3.in6;
++		fl.u.ip6.flowi6_proto = protocol;
++		fl.u.ip6.flowi6_oif = READ_ONCE(nss_ipsec.xfrm_ifindex);
++
++		dst = ip6_route_output(&init_net, NULL, &fl.u.ip6);
++		if (IS_ERR(dst))
++			return false;
++	}
++
++	if (!nss_ipsec_lookup_encap_sa(&fl, dst, st)) {
++		dst_release(dst);
++		return false;
++	}
++
++	dst_release(dst);
++	return true;
++}
++
++static void nss_ipsec_inner_flow_remove_locked(struct nss_ipsec_inner_flow *f)
++{
++	struct nss_core *core = nss_ipsec.core;
++	struct nss_ipsec_cmn_msg *m __free(kfree) = NULL;
++
++	list_del(&f->node);
++
++	if (core && READ_ONCE(core->running) && nss_ipsec.ready &&
++	    nss_ipsec.inner_if >= 0) {
++		m = kzalloc(sizeof(*m), GFP_KERNEL);
++		if (m) {
++			m->msg.flow.flow_tuple = f->flow_tuple;
++			m->msg.flow.sa_tuple = f->sa_tuple;
++			if (!nss_ipsec_msg_send(core, nss_ipsec.inner_if,
++						NSS_IPSEC_CMN_MSG_FLOW_DESTROY,
++						m, sizeof(m->msg.flow)))
++				nss_ipsec.flow_destroys++;
++		}
++	}
++
++	kfree(f);
++}
++
++int nss_ipsec_flow_add(unsigned long key, struct nf_conn *ct, bool v6,
++		       u8 protocol, int orig_ifindex, int reply_ifindex)
++{
++	struct nss_ipsec_cmn_msg *m __free(kfree) = NULL;
++	struct nss_ipsec_inner_flow *f, *old, *tmp;
++	int ret;
++
++	if (!nss_ipsec_owns(orig_ifindex) && !nss_ipsec_owns(reply_ifindex))
++		return 0;
++
++	guard(mutex)(&nss_ipsec_lock);
++
++	if (!nss_ipsec.ready || !nss_ipsec.core || !nss_ipsec.core->running)
++		return -ENODEV;
++
++	list_for_each_entry_safe(old, tmp, &nss_ipsec.flows, node)
++		if (old->key == key)
++			nss_ipsec_inner_flow_remove_locked(old);
++
++	f = kzalloc(sizeof(*f), GFP_KERNEL);
++	m = kzalloc(sizeof(*m), GFP_KERNEL);
++	if (!f || !m) {
++		kfree(f);
++		return -ENOMEM;
++	}
++
++	if (!nss_ipsec_build_inner_flow(ct, v6, protocol, orig_ifindex,
++					reply_ifindex, &f->flow_tuple,
++					&f->sa_tuple)) {
++		kfree(f);
++		return -ENOENT;
++	}
++
++	f->key = key;
++	m->msg.flow.flow_tuple = f->flow_tuple;
++	m->msg.flow.sa_tuple = f->sa_tuple;
++
++	ret = nss_ipsec_msg_send(nss_ipsec.core, nss_ipsec.inner_if,
++				 NSS_IPSEC_CMN_MSG_FLOW_CREATE, m,
++				 sizeof(m->msg.flow));
++	if (ret) {
++		kfree(f);
++		return ret;
++	}
++
++	list_add_tail(&f->node, &nss_ipsec.flows);
++	nss_ipsec.flow_creates++;
++
++	return 0;
++}
++
++void nss_ipsec_flow_del(unsigned long key)
++{
++	struct nss_ipsec_inner_flow *f, *tmp;
++
++	guard(mutex)(&nss_ipsec_lock);
++
++	list_for_each_entry_safe(f, tmp, &nss_ipsec.flows, node) {
++		if (f->key == key) {
++			nss_ipsec_inner_flow_remove_locked(f);
++			break;
++		}
++	}
++}
++
++static void nss_ipsec_xfrm_dev_bind(struct net_device *dev)
++{
++	struct net_device *old;
++
++	if (!nss_ipsec_is_xfrm_dev(dev) || !net_eq(dev_net(dev), &init_net))
++		return;
++
++	old = rcu_replace_pointer(nss_ipsec.xfrm_dev, dev, true);
++	if (old != dev) {
++		dev_hold(dev);
++		WRITE_ONCE(nss_ipsec.xfrm_ifindex, dev->ifindex);
++		if (old)
++			dev_put(old);
++	}
++}
++
++static void nss_ipsec_xfrm_dev_unbind(struct net_device *dev)
++{
++	struct net_device *cur;
++
++	cur = rcu_dereference_protected(nss_ipsec.xfrm_dev, true);
++	if (cur != dev)
++		return;
++
++	WRITE_ONCE(nss_ipsec.xfrm_ifindex, 0);
++	rcu_assign_pointer(nss_ipsec.xfrm_dev, NULL);
++	synchronize_rcu();
++	dev_put(dev);
++}
++
++static int nss_ipsec_netdev_event(struct notifier_block *nb,
++				  unsigned long event, void *ptr)
++{
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
++
++	switch (event) {
++	case NETDEV_UP:
++		nss_ipsec_xfrm_dev_bind(dev);
++		break;
++	case NETDEV_GOING_DOWN:
++	case NETDEV_UNREGISTER:
++		nss_ipsec_xfrm_dev_unbind(dev);
++		break;
++	}
++
++	return NOTIFY_DONE;
++}
++
++static struct notifier_block nss_ipsec_nb = {
++	.notifier_call = nss_ipsec_netdev_event,
++};
++
++int nss_ipsec_start(struct nss_core *core)
++{
++	struct nss_ipsec_cmn_msg m = {};
++	int ret;
++
++	if (core->id != 1 || !nss_ipsec_enable || !nss_crypto_ready())
++		return 0;
++
++	guard(mutex)(&nss_ipsec_lock);
++
++	if (nss_ipsec.ready)
++		return 0;
++
++	/* 1. Configure Core 1 IPsec base node (EIP-197 lookaside DMA enabled). */
++	m.msg.node.dma_lookaside = 1;
++	m.msg.node.dma_redirect = 0;
++	m.msg.node.max_sa = 0;
++	ret = nss_ipsec_msg_send(core, NSS_INTERFACE_IPSEC,
++				 NSS_IPSEC_CMN_MSG_NODE_CONFIG, &m,
++				 sizeof(m.msg.node));
++	if (ret) {
++		dev_err(core->dev, "ipsec: NODE_CONFIG failed: %d (err %u)\n",
++			ret, m.cm.error);
++		return ret;
++	}
++
++	/* 2. Allocate the 4 dynamic IPsec interfaces on Core 1. */
++	nss_ipsec.inner_if = nss_flow_dyn_alloc(core,
++			NSS_DYNAMIC_INTERFACE_TYPE_IPSEC_CMN_INNER);
++	if (nss_ipsec.inner_if < 0)
++		return nss_ipsec.inner_if;
++
++	nss_ipsec.mdata_inner_if = nss_flow_dyn_alloc(core,
++			NSS_DYNAMIC_INTERFACE_TYPE_IPSEC_CMN_MDATA_INNER);
++	if (nss_ipsec.mdata_inner_if < 0) {
++		ret = nss_ipsec.mdata_inner_if;
++		goto err_inner;
++	}
++
++	nss_ipsec.outer_if = nss_flow_dyn_alloc(core,
++			NSS_DYNAMIC_INTERFACE_TYPE_IPSEC_CMN_OUTER);
++	if (nss_ipsec.outer_if < 0) {
++		ret = nss_ipsec.outer_if;
++		goto err_mdata_inner;
++	}
++
++	nss_ipsec.mdata_outer_if = nss_flow_dyn_alloc(core,
++			NSS_DYNAMIC_INTERFACE_TYPE_IPSEC_CMN_MDATA_OUTER);
++	if (nss_ipsec.mdata_outer_if < 0) {
++		ret = nss_ipsec.mdata_outer_if;
++		goto err_outer;
++	}
++
++	/* 3. Cross-wire exception and sibling interfaces. */
++	ret = nss_ipsec_ctx_config(core, nss_ipsec.inner_if,
++				   NSS_IPSEC_CMN_CTX_INNER,
++				   nss_ipsec.outer_if,
++				   nss_ipsec.mdata_inner_if);
++	if (ret)
++		goto err_mdata_outer;
++
++	ret = nss_ipsec_ctx_config(core, nss_ipsec.mdata_inner_if,
++				   NSS_IPSEC_CMN_CTX_MDATA_INNER,
++				   nss_ipsec.outer_if, 0);
++	if (ret)
++		goto err_mdata_outer;
++
++	ret = nss_ipsec_ctx_config(core, nss_ipsec.outer_if,
++				   NSS_IPSEC_CMN_CTX_OUTER,
++				   nss_ipsec.inner_if,
++				   nss_ipsec.mdata_outer_if);
++	if (ret)
++		goto err_mdata_outer;
++
++	ret = nss_ipsec_ctx_config(core, nss_ipsec.mdata_outer_if,
++				   NSS_IPSEC_CMN_CTX_MDATA_OUTER,
++				   nss_ipsec.inner_if, 0);
++	if (ret)
++		goto err_mdata_outer;
++
++	nss_ipsec.inner_if_c1 = NSS_INTERFACE_WITH_COREID(1, nss_ipsec.inner_if);
++	nss_ipsec.outer_if_c1 = NSS_INTERFACE_WITH_COREID(1, nss_ipsec.outer_if);
++	nss_ipsec.core = core;
++
++	ret = nf_register_net_hooks(&init_net, nss_ipsec_nf_ops,
++				    ARRAY_SIZE(nss_ipsec_nf_ops));
++	if (ret)
++		goto err_mdata_outer;
++	nss_ipsec.nf_registered = true;
++
++	xfrm_register_km(&nss_ipsec_km);
++	nss_ipsec.km_registered = true;
++	WRITE_ONCE(nss_ipsec.ready, true);
++
++	schedule_work(&nss_ipsec.sync_work);
++
++	dev_info(core->dev,
++		 "ipsec ready: inner %d/%d (%#x) outer %d/%d (%#x)\n",
++		 nss_ipsec.inner_if, nss_ipsec.mdata_inner_if,
++		 nss_ipsec.inner_if_c1, nss_ipsec.outer_if,
++		 nss_ipsec.mdata_outer_if, nss_ipsec.outer_if_c1);
++
++	return 0;
++
++err_mdata_outer:
++	nss_flow_dyn_free(core, NSS_DYNAMIC_INTERFACE_TYPE_IPSEC_CMN_MDATA_OUTER,
++			  nss_ipsec.mdata_outer_if);
++	nss_ipsec.mdata_outer_if = -1;
++err_outer:
++	nss_flow_dyn_free(core, NSS_DYNAMIC_INTERFACE_TYPE_IPSEC_CMN_OUTER,
++			  nss_ipsec.outer_if);
++	nss_ipsec.outer_if = -1;
++err_mdata_inner:
++	nss_flow_dyn_free(core, NSS_DYNAMIC_INTERFACE_TYPE_IPSEC_CMN_MDATA_INNER,
++			  nss_ipsec.mdata_inner_if);
++	nss_ipsec.mdata_inner_if = -1;
++err_inner:
++	nss_flow_dyn_free(core, NSS_DYNAMIC_INTERFACE_TYPE_IPSEC_CMN_INNER,
++			  nss_ipsec.inner_if);
++	nss_ipsec.inner_if = -1;
++	return ret;
++}
++
++void nss_ipsec_stop(struct nss_core *core)
++{
++	struct nss_ipsec_inner_flow *f, *ftmp;
++	struct nss_ipsec_sa *sa, *tmp;
++
++	if (core->id != 1)
++		return;
++
++	WRITE_ONCE(nss_ipsec.ready, false);
++	cancel_work_sync(&nss_ipsec.sync_work);
++
++	guard(mutex)(&nss_ipsec_lock);
++
++	if (nss_ipsec.km_registered) {
++		xfrm_unregister_km(&nss_ipsec_km);
++		nss_ipsec.km_registered = false;
++	}
++	if (nss_ipsec.nf_registered) {
++		nf_unregister_net_hooks(&init_net, nss_ipsec_nf_ops,
++					ARRAY_SIZE(nss_ipsec_nf_ops));
++		nss_ipsec.nf_registered = false;
++	}
++
++	list_for_each_entry_safe(f, ftmp, &nss_ipsec.flows, node) {
++		list_del(&f->node);
++		kfree(f);
++	}
++
++	list_for_each_entry_safe(sa, tmp, &nss_ipsec.sas, node)
++		nss_ipsec_sa_remove(sa);
++
++	nss_ipsec.inner_if = -1;
++	nss_ipsec.mdata_inner_if = -1;
++	nss_ipsec.outer_if = -1;
++	nss_ipsec.mdata_outer_if = -1;
++	nss_ipsec.inner_if_c1 = 0;
++	nss_ipsec.outer_if_c1 = 0;
++	nss_ipsec.core = NULL;
++}
++
++void nss_ipsec_print(struct seq_file *s)
++{
++	struct nss_ipsec_sa *sa;
++	struct nss_ipsec_outer_rule *r;
++	struct net_device *xdev;
++
++	guard(mutex)(&nss_ipsec_lock);
++
++	seq_printf(s, "enabled: %u ready: %u\n", nss_ipsec_enable,
++		   nss_ipsec.ready);
++	seq_printf(s, "ifaces: inner %d/%d (%#x) outer %d/%d (%#x)\n",
++		   nss_ipsec.inner_if, nss_ipsec.mdata_inner_if,
++		   nss_ipsec.inner_if_c1, nss_ipsec.outer_if,
++		   nss_ipsec.mdata_outer_if, nss_ipsec.outer_if_c1);
++
++	rcu_read_lock();
++	xdev = rcu_dereference(nss_ipsec.xfrm_dev);
++	seq_printf(s, "xfrm_dev: %s (ifindex %d)\n",
++		   xdev ? xdev->name : "none", nss_ipsec.xfrm_ifindex);
++	rcu_read_unlock();
++
++	seq_printf(s, "fw_inner_tx: %llu pkts %llu bytes  fw_outer_rx: %llu pkts %llu bytes\n",
++		   nss_ipsec.inner_tx_pkts, nss_ipsec.inner_tx_bytes,
++		   nss_ipsec.outer_rx_pkts, nss_ipsec.outer_rx_bytes);
++	seq_printf(s, "host: mdata_tx %llu drop %llu except_in %llu except_out %llu\n",
++		   nss_ipsec.mdata_encap_tx, nss_ipsec.mdata_encap_drop,
++		   nss_ipsec.inner_except_rx, nss_ipsec.outer_except_rx);
++	seq_printf(s, "flows: create %llu destroy %llu outer_rules %llu\n",
++		   nss_ipsec.flow_creates, nss_ipsec.flow_destroys,
++		   nss_ipsec.outer_rules_pushed);
++
++	list_for_each_entry(sa, &nss_ipsec.sas, node)
++		seq_printf(s, "sa %s spi %#x v%u proto %u sport %u dport %u crypto %u if_id %u\n",
++			   sa->decap ? "decap" : "encap", sa->tuple.spi_index,
++			   sa->tuple.ip_ver, sa->tuple.protocol,
++			   sa->tuple.src_port, sa->tuple.dest_port,
++			   sa->crypto_idx, sa->if_id);
++
++	list_for_each_entry(r, &nss_ipsec.outer_rules, node)
++		seq_printf(s, "outer v%u proto %u ports %u->%u ref %u installed %u\n",
++			   r->ip_ver, r->protocol, r->local_port,
++			   r->remote_port, r->ref, r->installed);
++}
++
++int nss_ipsec_init(void)
++{
++	struct net_device *dev;
++	int ret;
++
++	INIT_LIST_HEAD(&nss_ipsec.sas);
++	INIT_LIST_HEAD(&nss_ipsec.outer_rules);
++	INIT_LIST_HEAD(&nss_ipsec.flows);
++	INIT_WORK(&nss_ipsec.sync_work, nss_ipsec_reconcile);
++
++	ret = register_netdevice_notifier(&nss_ipsec_nb);
++	if (ret)
++		return ret;
++
++	rtnl_lock();
++	for_each_netdev(&init_net, dev)
++		if (dev->flags & IFF_UP)
++			nss_ipsec_xfrm_dev_bind(dev);
++	rtnl_unlock();
++
++	return 0;
++}
++
++void nss_ipsec_exit(void)
++{
++	struct net_device *dev;
++
++	unregister_netdevice_notifier(&nss_ipsec_nb);
++	rtnl_lock();
++	dev = rcu_dereference_protected(nss_ipsec.xfrm_dev, true);
++	if (dev)
++		nss_ipsec_xfrm_dev_unbind(dev);
++	rtnl_unlock();
++}
++
++#else /* !CONFIG_XFRM */
++
++int nss_ipsec_init(void) { return 0; }
++void nss_ipsec_exit(void) {}
++int nss_ipsec_start(struct nss_core *core) { return 0; }
++void nss_ipsec_stop(struct nss_core *core) {}
++void nss_ipsec_notify(struct nss_core *core, const struct nss_cmn_msg *ncm, u32 len) {}
++bool nss_ipsec_recv(struct nss_core *core, struct napi_struct *napi,
++		    const struct n2h_descriptor *desc, struct sk_buff *skb) { return false; }
++bool nss_ipsec_owns(int ifindex) { return false; }
++int nss_ipsec_ifnum(int ifindex, u32 *mtu) { return -ENODEV; }
++int nss_ipsec_flow_add(unsigned long key, struct nf_conn *ct, bool v6,
++		       u8 protocol, int orig_ifindex, int reply_ifindex) { return 0; }
++void nss_ipsec_flow_del(unsigned long key) {}
++void nss_ipsec_print(struct seq_file *s)
++{
++	seq_puts(s, "unavailable: kernel built without CONFIG_XFRM\n");
++}
++
++#endif /* CONFIG_XFRM */
+diff --git a/package/kernel/nss-wifi-drv/src/nss_ipsec.h b/package/kernel/nss-wifi-drv/src/nss_ipsec.h
+new file mode 100644
+index 0000000000..e706616ad3
+--- /dev/null
++++ b/package/kernel/nss-wifi-drv/src/nss_ipsec.h
+@@ -0,0 +1,41 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Inline IPsec offload on NSS Core 1 (nss_ipsec_cmn + EIP-197 + C2C). */
++
++#ifndef __NSS_IPSEC_H
++#define __NSS_IPSEC_H
++
++#include <linux/netdevice.h>
++#include <linux/seq_file.h>
++#include <linux/skbuff.h>
++#include <linux/types.h>
++
++struct nss_core;
++struct nss_cmn_msg;
++struct n2h_descriptor;
++struct nf_conn;
++struct napi_struct;
++
++/* MTU advertised to Core 0 for the IPsec inner interface so Core 0 hands full
++ * inner packets to Core 1 without pre-fragmentation.
++ */
++#define NSS_IPSEC_INNER_MTU	9000
++
++int nss_ipsec_init(void);
++void nss_ipsec_exit(void);
++int nss_ipsec_start(struct nss_core *core);
++void nss_ipsec_stop(struct nss_core *core);
++void nss_ipsec_notify(struct nss_core *core, const struct nss_cmn_msg *ncm,
++		      u32 len);
++bool nss_ipsec_recv(struct nss_core *core, struct napi_struct *napi,
++		    const struct n2h_descriptor *desc, struct sk_buff *skb);
++
++/* Hooks used by nss_flow.c for XFRM interface flowtable offload. */
++bool nss_ipsec_is_xfrm_dev(const struct net_device *dev);
++bool nss_ipsec_owns(int ifindex);
++int nss_ipsec_ifnum(int ifindex, u32 *mtu);
++int nss_ipsec_flow_add(unsigned long key, struct nf_conn *ct, bool v6,
++		       u8 protocol, int orig_ifindex, int reply_ifindex);
++void nss_ipsec_flow_del(unsigned long key);
++void nss_ipsec_print(struct seq_file *s);
++
++#endif /* __NSS_IPSEC_H */
+diff --git a/package/kernel/nss-wifi-drv/src/nss_msg.c b/package/kernel/nss-wifi-drv/src/nss_msg.c
+index bc3aab2aec..2eb38b6697 100644
+--- a/package/kernel/nss-wifi-drv/src/nss_msg.c
++++ b/package/kernel/nss-wifi-drv/src/nss_msg.c
+@@ -314,8 +314,15 @@ int nss_msg_probe(struct nss_core *core, struct seq_file *s)
+ 	nss_alloc_probe(core, s, NSS_DYNAMIC_INTERFACE_TYPE_GENERIC_REDIR_H2N,
+ 			"redir h2n");
+ 
+-	if (core->id != 0)
++	if (core->id != 0) {
++		nss_alloc_probe(core, s,
++				NSS_DYNAMIC_INTERFACE_TYPE_IPSEC_CMN_INNER,
++				"ipsec inner");
++		nss_alloc_probe(core, s,
++				NSS_DYNAMIC_INTERFACE_TYPE_IPSEC_CMN_OUTER,
++				"ipsec outer");
+ 		return 0;
++	}
+ 
+ 	return nss_wifili_probe(core, s);
+ }
+diff --git a/package/kernel/nss-wifi-drv/src/nss_ring.c b/package/kernel/nss-wifi-drv/src/nss_ring.c
+index 76705dc5a9..f26ea1dbbe 100644
+--- a/package/kernel/nss-wifi-drv/src/nss_ring.c
++++ b/package/kernel/nss-wifi-drv/src/nss_ring.c
+@@ -23,6 +23,7 @@
+ 
+ #include "nss_drv.h"
+ #include "nss_crypto.h"
++#include "nss_ipsec.h"
+ 
+ #define NSS_NAPI_WEIGHT		64
+ #define NSS_REFILL_BATCH	64
+@@ -180,6 +181,7 @@ static void nss_notify_recv(struct nss_core *core,
+ 	nss_core_load_notify(core, ncm, desc->payload_len);
+ 	nss_c2c_notify(core, ncm, desc->payload_len);
+ 	nss_crypto_notify(core, ncm, desc->payload_len);
++	nss_ipsec_notify(core, ncm, desc->payload_len);
+ 
+ 	if (core->id != 0)
+ 		return;
+@@ -798,7 +800,8 @@ static int nss_poll_n2h(struct napi_struct *napi, int budget)
+ 					goto next;
+ 				}
+ 				atomic_dec(&core->buffers_queued);
+-				if (nss_redir_recv(core, desc, skb) ||
++				if (nss_ipsec_recv(core, napi, desc, skb) ||
++				    nss_redir_recv(core, desc, skb) ||
+ 				    nss_mesh_recv(core, napi, desc, skb) ||
+ 				    nss_data_recv(core, napi, desc, skb))
+ 					goto next;

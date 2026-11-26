@@ -1,0 +1,895 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Myles Liu <lyx981mike@gmail.com>
+Date: Thu, 26 Nov 2026 13:18:42 -0800
+Subject: [PATCH] nss-wifi-drv: enable NSS Core 1 boot and C2C pairing
+
+Enable the &nss1 DT node on Linksys MX4300 and extend nss-wifi-drv to support booting Core 1 independently of Core 0 (without touching EDMA, PPE, or Wi-Fi), with per-core buffer pool sizing, locked shared misc_reset updates, and automatic bidirectional C2C queue pairing plus /sys/kernel/debug/<core>/c2c diagnostics.
+---
+ package/kernel/nss-wifi-drv/src/nss_core.c    | 475 +++++++++++++-----
+ package/kernel/nss-wifi-drv/src/nss_drv.h     |  22 +-
+ package/kernel/nss-wifi-drv/src/nss_meminfo.c |   5 +
+ package/kernel/nss-wifi-drv/src/nss_msg.c     |   3 +
+ package/kernel/nss-wifi-drv/src/nss_ring.c    |   7 +-
+ .../linux/qualcommax/dts/ipq8174-mx4300.dts   |   9 +
+ 6 files changed, 402 insertions(+), 119 deletions(-)
+
+diff --git a/package/kernel/nss-wifi-drv/src/nss_core.c b/package/kernel/nss-wifi-drv/src/nss_core.c
+index cd3d175417..bc1ef8a295 100644
+--- a/package/kernel/nss-wifi-drv/src/nss_core.c
++++ b/package/kernel/nss-wifi-drv/src/nss_core.c
+@@ -42,10 +42,26 @@
+ #define NSS_CORE_BAR			0x0008
+ #define NSS_CORE_AMC			0x000c
+ #define NSS_CORE_BOOT_ADDR		0x0010
++#define NSS_CORE_C2C_INTR_SET		0x0018
+ #define NSS_CORE_INT_STAT2_TYPE		0x0040
+ #define NSS_CORE_INT_STAT3_TYPE		0x0044
+ #define NSS_CORE_IFETCH_RANGE		0x0048
+ 
++/* Shared between cores: misc_reset is a single register with one byte per core,
++ * and C2C pairing touches both cores' state.
++ */
++static DEFINE_SPINLOCK(nss_misc_reset_lock);
++static DEFINE_MUTEX(nss_c2c_lock);
++static struct nss_core *nss_cores[NSS_MAX_CORES];
++
++struct nss_core *nss_core_get(u32 id)
++{
++	if (id >= NSS_MAX_CORES)
++		return NULL;
++
++	return READ_ONCE(nss_cores[id]);
++}
++
+ /* The core reaches its peripherals through a fixed aperture, and may fetch
+  * instructions only from the window the image is linked into. Both are
+  * properties of how the firmware was built.
+@@ -384,32 +400,39 @@ static void nss_edma_reset_work(struct work_struct *work)
+ 	nss_edma_settle(container_of(work, struct nss_core, edma_reset));
+ }
+ 
+-static void nss_core_release(struct nss_core *core)
++static void nss_misc_reset_update(struct nss_core *core, u32 set_bits,
++				  u32 clear_bits)
+ {
++	u32 shift = NSS_MISC_RESET_SHIFT(core->id);
+ 	u32 val;
+ 
++	guard(spinlock_irqsave)(&nss_misc_reset_lock);
++	val = readl(core->misc_reset);
++	val |= set_bits << shift;
++	val &= ~(clear_bits << shift);
++	writel(val, core->misc_reset);
++}
++
++static void nss_core_release(struct nss_core *core)
++{
+ 	/* Start from the state a cold boot starts from, whatever the last
+ 	 * occupant left: both reset sets asserted and the fetch clamp on. A
+ 	 * release over half-reset state boots a core whose peripheral block
+ 	 * is dead, and the firmware then traps on its first access into it.
+ 	 */
+ 	writel(1, core->nphys + NSS_CORE_RESET_CTRL);
+-	val = readl(core->misc_reset);
+-	val |= (NSS_MISC_RESET_FIRST | NSS_MISC_RESET_SECOND) <<
+-	       NSS_MISC_RESET_SHIFT(core->id);
+-	writel(val, core->misc_reset);
++	nss_misc_reset_update(core, NSS_MISC_RESET_FIRST | NSS_MISC_RESET_SECOND,
++			      0);
+ 	usleep_range(10, 20);
+ 
+-	val &= ~(NSS_MISC_RESET_FIRST << NSS_MISC_RESET_SHIFT(core->id));
+-	writel(val, core->misc_reset);
++	nss_misc_reset_update(core, 0, NSS_MISC_RESET_FIRST);
+ 
+ 	/* The core needs 10 to 20 cycles after its reset clamp is released
+ 	 * before the second set may follow.
+ 	 */
+ 	usleep_range(10, 20);
+ 
+-	val &= ~(NSS_MISC_RESET_SECOND << NSS_MISC_RESET_SHIFT(core->id));
+-	writel(val, core->misc_reset);
++	nss_misc_reset_update(core, 0, NSS_MISC_RESET_SECOND);
+ 
+ 	/* Hold the core while its address configuration is written, so it
+ 	 * cannot fetch from a window it has not been given yet.
+@@ -449,23 +472,25 @@ static void nss_core_release(struct nss_core *core)
+  */
+ static void nss_core_halt(struct nss_core *core)
+ {
+-	u32 val;
++	struct nss_core *peer = nss_core_get(core->id ^ 1);
+ 
+ 	if (!core->loaded)
+ 		return;
+ 
+-	qca_ppe_fw_carrier_set(core->conduit, NULL);
++	WRITE_ONCE(core->c2c_ready, false);
++	if (peer)
++		WRITE_ONCE(peer->c2c_ready, false);
++
++	if (core->id == 0)
++		qca_ppe_fw_carrier_set(core->conduit, NULL);
+ 	writel(1, core->nphys + NSS_CORE_RESET_CTRL);
+ 
+-	val = readl(core->misc_reset);
+-	val |= NSS_MISC_RESET_SECOND << NSS_MISC_RESET_SHIFT(core->id);
+-	writel(val, core->misc_reset);
++	nss_misc_reset_update(core, NSS_MISC_RESET_SECOND, 0);
+ 
+ 	/* The same settle the release path needs between the two sets. */
+ 	usleep_range(10, 20);
+ 
+-	val |= NSS_MISC_RESET_FIRST << NSS_MISC_RESET_SHIFT(core->id);
+-	writel(val, core->misc_reset);
++	nss_misc_reset_update(core, NSS_MISC_RESET_FIRST, 0);
+ 
+ 	/* Wait out any message or frame already past its running check: the
+ 	 * rings and the lent table go below.
+@@ -475,24 +500,28 @@ static void nss_core_halt(struct nss_core *core)
+ 		core->msg.lost = false;
+ 	}
+ 	synchronize_net();
+-	/* A core in reset cannot be asked to close its ports, and holds
+-	 * nothing of theirs in the switch.
+-	 */
+-	core->phys_armed = 0;
+-	nss_bridge_stop();
+-	nss_flow_flush();
+-	nss_mc_flush();
+-	nss_redir_halt(core);
++	if (core->id == 0) {
++		/* A core in reset cannot be asked to close its ports, and holds
++		 * nothing of theirs in the switch.
++		 */
++		core->phys_armed = 0;
++		nss_bridge_stop();
++		nss_flow_flush();
++		nss_mc_flush();
++		nss_redir_halt(core);
++	}
+ 
+ 	nss_log_shadow_stop(core);
+ 	nss_rings_stop(core);
+-	nss_iface_unbind(core);
++	if (core->id == 0) {
++		nss_iface_unbind(core);
+ 
+-	/* The core is in reset by now, so the block may be reset under it.
+-	 * This hands the CPU port back, and a later boot starts from the
+-	 * same place this one did.
+-	 */
+-	schedule_work(&core->edma_reset);
++		/* The core is in reset by now, so the block may be reset under
++		 * it. This hands the CPU port back, and a later boot starts
++		 * from the same place this one did.
++		 */
++		schedule_work(&core->edma_reset);
++	}
+ 
+ 	nss_pbuf_pool_free(core);
+ 	nss_mem_free_all(core);
+@@ -520,24 +549,38 @@ static void nss_core_halt(struct nss_core *core)
+  */
+ static unsigned int nss_pool_size = 16384;
+ module_param_named(pool_size, nss_pool_size, uint, 0644);
+-MODULE_PARM_DESC(pool_size, "empty buffers the host will lend the firmware");
++MODULE_PARM_DESC(pool_size, "empty buffers the host will lend core 0");
+ 
+ static unsigned int nss_pool_low = 4352;
+ module_param_named(pool_low, nss_pool_low, uint, 0644);
+-MODULE_PARM_DESC(pool_low, "buffers below which the firmware asks for more");
++MODULE_PARM_DESC(pool_low, "buffers below which core 0 asks for more");
++
++static unsigned int nss_core1_pool_size = 2048;
++module_param_named(core1_pool_size, nss_core1_pool_size, uint, 0644);
++MODULE_PARM_DESC(core1_pool_size, "empty buffers the host will lend core 1");
++
++static unsigned int nss_core1_pool_low = 256;
++module_param_named(core1_pool_low, nss_core1_pool_low, uint, 0644);
++MODULE_PARM_DESC(core1_pool_low, "buffers below which core 1 asks for more");
++
++static unsigned int nss_pool_low_get(const struct nss_core *core)
++{
++	unsigned int low = core->id == 0 ? nss_pool_low : nss_core1_pool_low;
++
++	return max_t(unsigned int, low, NSS_RING_ENTRIES);
++}
++
+ /* The firmware refuses a span narrower than the ring the pool is topped up
+  * through, so the asked-for ceiling is not always the one that takes effect.
+  * The table of lent buffers is sized from the same answer, and is allocated
+  * before the pool is configured.
+  */
+-unsigned int nss_pool_ceiling(void)
++unsigned int nss_pool_ceiling(const struct nss_core *core)
+ {
+-	if (nss_pool_low < NSS_RING_ENTRIES)
+-		nss_pool_low = NSS_RING_ENTRIES;
+-	if (nss_pool_size < 2 * nss_pool_low)
+-		nss_pool_size = 2 * nss_pool_low;
++	unsigned int low = nss_pool_low_get(core);
++	unsigned int size = core->id == 0 ? nss_pool_size : nss_core1_pool_size;
+ 
+-	return nss_pool_size;
++	return max_t(unsigned int, size, 2 * low);
+ }
+ 
+ #define NSS_N2H_RPS_CFG			1
+@@ -588,7 +631,7 @@ static int nss_pool_set(struct nss_core *core, u32 payloads)
+ 
+ 	wm.cm.interface = NSS_INTERFACE_N2H;
+ 	wm.cm.type = NSS_N2H_SET_WATER_MARK;
+-	wm.low_water = cpu_to_be32(nss_pool_low);
++	wm.low_water = cpu_to_be32(nss_pool_low_get(core));
+ 	wm.high_water = cpu_to_be32(payloads);
+ 
+ 	/* Recorded before the message goes out, because this is the first one
+@@ -652,10 +695,11 @@ static void nss_accel_in_core(struct nss_core *core)
+ static void nss_pool_configure(struct nss_core *core)
+ {
+ 	struct nss_n2h_payload_info p = {};
++	u32 ceiling = nss_pool_ceiling(core);
+ 	int ret;
+ 
+-	ret = nss_pool_set(core, nss_pool_ceiling());
+-	dev_info(core->dev, "payload pool set to %u: %d\n", nss_pool_size, ret);
++	ret = nss_pool_set(core, ceiling);
++	dev_info(core->dev, "payload pool set to %u: %d\n", ceiling, ret);
+ 
+ 	p.cm.interface = NSS_INTERFACE_N2H;
+ 	p.cm.type = NSS_N2H_GET_WATER_MARK;
+@@ -689,7 +733,11 @@ struct nss_n2h_buf_pool {
+ 
+ static unsigned int nss_pbuf_bytes = 3100000;
+ module_param_named(pbuf_bytes, nss_pbuf_bytes, uint, 0644);
+-MODULE_PARM_DESC(pbuf_bytes, "memory lent for the firmware's packet descriptors");
++MODULE_PARM_DESC(pbuf_bytes, "memory lent for core 0 packet descriptors");
++
++static unsigned int nss_core1_pbuf_bytes = 524288;
++module_param_named(core1_pbuf_bytes, nss_core1_pbuf_bytes, uint, 0644);
++MODULE_PARM_DESC(core1_pbuf_bytes, "memory lent for core 1 packet descriptors");
+ 
+ void nss_pbuf_pool_free(struct nss_core *core)
+ {
+@@ -871,6 +919,90 @@ void nss_core_load_notify(struct nss_core *core, const struct nss_cmn_msg *ncm,
+ 	core->load_samples++;
+ }
+ 
++/* Core-to-core (C2C) queue pairing and statistics. */
++#define NSS_C2C_TX_MSG_TYPE_STATS		0
++#define NSS_C2C_TX_MSG_TYPE_TX_MAP		1
++#define NSS_C2C_TX_MSG_TYPE_PERFORMANCE_TEST	2
++
++struct nss_c2c_tx_map {
++	u32 tx_map;
++	u32 c2c_intr_addr;
++};
++
++struct nss_c2c_tx_test {
++	u32 test_id;
++};
++
++struct nss_c2c_tx_msg {
++	struct nss_cmn_msg cm;
++	union {
++		struct nss_c2c_tx_map map;
++		struct nss_c2c_tx_test test;
++		struct nss_cmn_node_stats stats;
++	} msg;
++};
++
++static int nss_c2c_send_map(struct nss_core *src, struct nss_core *dst)
++{
++	struct nss_c2c_tx_msg m = {};
++	int ret;
++
++	m.cm.interface = NSS_INTERFACE_C2C_TX;
++	m.cm.type = NSS_C2C_TX_MSG_TYPE_TX_MAP;
++	m.msg.map.tx_map = dst->c2c_start_dma;
++	m.msg.map.c2c_intr_addr = (u32)dst->nphys_base + NSS_CORE_C2C_INTR_SET;
++
++	ret = nss_msg_send(src, &m, offsetof(struct nss_c2c_tx_msg, msg) +
++				    sizeof(m.msg.map));
++	if (ret)
++		dev_err(src->dev, "C2C map to core %u failed: %d (err %u)\n",
++			dst->id, ret, m.cm.error);
++	else
++		dev_info(src->dev, "C2C paired with core %u (queue %#x intr %#x)\n",
++			 dst->id, m.msg.map.tx_map, m.msg.map.c2c_intr_addr);
++
++	return ret;
++}
++
++static void nss_c2c_try_setup(void)
++{
++	struct nss_core *c0, *c1;
++
++	guard(mutex)(&nss_c2c_lock);
++
++	c0 = nss_core_get(0);
++	c1 = nss_core_get(1);
++	if (!c0 || !c1 || !READ_ONCE(c0->running) || !READ_ONCE(c1->running))
++		return;
++	if (!c0->c2c_start_dma || !c1->c2c_start_dma)
++		return;
++	if (READ_ONCE(c0->c2c_ready) && READ_ONCE(c1->c2c_ready))
++		return;
++
++	if (nss_c2c_send_map(c0, c1) || nss_c2c_send_map(c1, c0))
++		return;
++
++	WRITE_ONCE(c0->c2c_ready, true);
++	WRITE_ONCE(c1->c2c_ready, true);
++}
++
++void nss_c2c_notify(struct nss_core *core, const struct nss_cmn_msg *ncm,
++		    u32 len)
++{
++	u32 iface = NSS_INTERFACE_NUM_GET(ncm->interface);
++	const struct nss_cmn_node_stats *st;
++
++	if (ncm->type != NSS_C2C_TX_MSG_TYPE_STATS ||
++	    len < sizeof(*ncm) + sizeof(*st))
++		return;
++
++	st = (const struct nss_cmn_node_stats *)(ncm + 1);
++	if (iface == NSS_INTERFACE_C2C_TX)
++		core->c2c_tx_pkts += st->tx_packets;
++	else if (iface == NSS_INTERFACE_C2C_RX)
++		core->c2c_rx_pkts += st->rx_packets;
++}
++
+ static int nss_core_boot(struct nss_core *core)
+ {
+ 	int ret;
+@@ -880,8 +1012,8 @@ static int nss_core_boot(struct nss_core *core)
+ 	if (core->loaded)
+ 		return -EBUSY;
+ 
+-	/* Callers run nss_edma_settle() first. */
+-	if (core->edma_stale) {
++	/* Callers run nss_edma_settle() first on core 0. */
++	if (core->id == 0 && core->edma_stale) {
+ 		dev_err(core->dev, "EDMA not reset since a core last ran\n");
+ 		return -EAGAIN;
+ 	}
+@@ -907,10 +1039,12 @@ static int nss_core_boot(struct nss_core *core)
+ 	if (ret)
+ 		goto free;
+ 
+-	nss_iface_bind(core);
++	if (core->id == 0) {
++		nss_iface_bind(core);
++		core->edma_stale = true;
++	}
+ 
+ 	core->loaded = true;
+-	core->edma_stale = true;
+ 	nss_log_shadow_start(core);
+ 
+ 	/* A boot that timed out and was then answered leaves the completion
+@@ -928,29 +1062,36 @@ static int nss_core_boot(struct nss_core *core)
+ 		return -ETIMEDOUT;
+ 	}
+ 
+-	/* The firmware maps CPU queues 4-7 to receive ring 3 and never drains
+-	 * it. Ring 3 takes its buffers from the same fill ring as ring 0, so
+-	 * 255 frames there stop all receive from the CPU port. Ring 0 hands
+-	 * the host everything it receives.
+-	 */
+-	ret = qca_edma_cpu_queues_to_ring(core->conduit, 0);
+-	if (ret)
+-		dev_err(core->dev, "CPU queues not moved to ring 0: %d\n", ret);
++	if (core->id == 0) {
++		/* The firmware maps CPU queues 4-7 to receive ring 3 and never
++		 * drains it. Ring 3 takes its buffers from the same fill ring
++		 * as ring 0, so 255 frames there stop all receive from the CPU
++		 * port. Ring 0 hands the host everything it receives.
++		 */
++		ret = qca_edma_cpu_queues_to_ring(core->conduit, 0);
++		if (ret)
++			dev_err(core->dev, "CPU queues not moved to ring 0: %d\n",
++				ret);
+ 
+-	ret = qca_ppe_fw_booted(core->conduit);
+-	if (ret)
+-		dev_err(core->dev, "PPE tables not restored: %d\n", ret);
++		ret = qca_ppe_fw_booted(core->conduit);
++		if (ret)
++			dev_err(core->dev, "PPE tables not restored: %d\n", ret);
+ 
+-	ret = qca_ppe_fw_carrier_set(core->conduit, nss_flow_is_ours);
+-	if (ret)
+-		dev_err(core->dev, "flows not steered to the firmware: %d\n", ret);
++		ret = qca_ppe_fw_carrier_set(core->conduit, nss_flow_is_ours);
++		if (ret)
++			dev_err(core->dev,
++				"flows not steered to the firmware: %d\n", ret);
++	}
+ 
+ 	nss_pool_configure(core);
+-	nss_accel_in_core(core);
++	if (core->id == 0)
++		nss_accel_in_core(core);
+ 	nss_rps_enable(core);
+-	nss_pbuf_pool_add(core, nss_pbuf_bytes);
++	nss_pbuf_pool_add(core, core->id == 0 ? nss_pbuf_bytes :
++						nss_core1_pbuf_bytes);
+ 	nss_core_stats_off(core);
+-	nss_bridge_start(core);
++	if (core->id == 0)
++		nss_bridge_start(core);
+ 
+ 	return 0;
+ 
+@@ -982,7 +1123,8 @@ void nss_core_stop(struct nss_core *core)
+ void nss_core_fault(struct nss_core *core)
+ {
+ 	core->running = false;
+-	qca_edma_cpu_queues_to_host(core->conduit);
++	if (core->id == 0)
++		qca_edma_cpu_queues_to_host(core->conduit);
+ 	core->faulted = true;
+ 	schedule_work(&core->restart);
+ }
+@@ -1019,28 +1161,35 @@ static void nss_core_restart(struct work_struct *work)
+ 		/* The radios still hold buffers the dead core lent them, so
+ 		 * the WLAN driver's reset halts it, and resumes it after.
+ 		 */
+-		if (nss_wifili_reset(core, true))
++		if (core->id == 0 && nss_wifili_reset(core, true))
+ 			return;
+ 
+ 		scoped_guard(mutex, &core->lock)
+ 			nss_core_halt(core);
+-		nss_wifili_halted(core);
++		if (core->id == 0)
++			nss_wifili_halted(core);
+ 	}
+ 
+-	nss_edma_settle(core);
++	if (core->id == 0)
++		nss_edma_settle(core);
+ 	scoped_guard(mutex, &core->lock)
+ 		if (READ_ONCE(core->up) && !core->loaded)
+ 			ret = nss_core_boot(core);
++	if (!ret && READ_ONCE(core->running))
++		nss_c2c_try_setup();
+ 	/* After a fault the radios' interfaces are registered with the dead
+ 	 * instance; after a WLAN reset they are about to register again.
+ 	 */
+-	if (!ret && fault)
+-		nss_wifili_reset(core, false);
+-	else if (!ret)
+-		nss_wifili_resume(core);
++	if (core->id == 0) {
++		if (!ret && fault)
++			nss_wifili_reset(core, false);
++		else if (!ret)
++			nss_wifili_resume(core);
++	}
+ 	complete_all(&core->resumed);
+ 
+-	nss_phys_arm_ports(core);
++	if (core->id == 0)
++		nss_phys_arm_ports(core);
+ }
+ 
+ static void nss_phys_work(struct work_struct *work)
+@@ -1056,7 +1205,7 @@ static int nss_boot_set(void *data, u64 val)
+ 	WRITE_ONCE(core->up, val);
+ 
+ 	if (!val) {
+-		if (nss_wifili_reset(core, true) &&
++		if (core->id == 0 && nss_wifili_reset(core, true) &&
+ 		    !wait_var_event_timeout(&core->loaded,
+ 					    !READ_ONCE(core->loaded),
+ 					    NSS_HALT_TIMEOUT))
+@@ -1064,19 +1213,25 @@ static int nss_boot_set(void *data, u64 val)
+ 
+ 		scoped_guard(mutex, &core->lock)
+ 			nss_core_halt(core);
+-		nss_wifili_halted(core);
++		if (core->id == 0)
++			nss_wifili_halted(core);
+ 		return 0;
+ 	}
+ 
+-	nss_edma_settle(core);
++	if (core->id == 0)
++		nss_edma_settle(core);
+ 	scoped_guard(mutex, &core->lock)
+ 		ret = nss_core_boot(core);
+ 	if (ret)
+ 		return ret;
+ 
+-	nss_phys_arm_ports(core);
+-	/* The radios' interfaces registered with the last instance. */
+-	nss_wifili_reset(core, false);
++	nss_c2c_try_setup();
++
++	if (core->id == 0) {
++		nss_phys_arm_ports(core);
++		/* The radios' interfaces registered with the last instance. */
++		nss_wifili_reset(core, false);
++	}
+ 
+ 	return 0;
+ }
+@@ -1366,6 +1521,65 @@ static int nss_load_show(struct seq_file *s, void *unused)
+ }
+ DEFINE_SHOW_ATTRIBUTE(nss_load);
+ 
++static int nss_c2c_show(struct seq_file *s, void *unused)
++{
++	struct nss_core *core = s->private;
++	struct nss_core *peer = nss_core_get(core->id ^ 1);
++
++	seq_printf(s, "core: %u\n", core->id);
++	seq_printf(s, "ready: %u\n", READ_ONCE(core->c2c_ready));
++	seq_printf(s, "queue_dma: %#x\n", core->c2c_start_dma);
++	seq_printf(s, "intr_addr: %#x\n",
++		   (u32)core->nphys_base + NSS_CORE_C2C_INTR_SET);
++	if (peer)
++		seq_printf(s, "peer: core %u running %u queue_dma %#x\n",
++			   peer->id, READ_ONCE(peer->running),
++			   peer->c2c_start_dma);
++	seq_printf(s, "tx_pkts: %llu\n", core->c2c_tx_pkts);
++	seq_printf(s, "rx_pkts: %llu\n", core->c2c_rx_pkts);
++
++	return 0;
++}
++
++static int nss_c2c_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, nss_c2c_show, inode->i_private);
++}
++
++static ssize_t nss_c2c_write(struct file *file, const char __user *buf,
++			     size_t count, loff_t *ppos)
++{
++	struct seq_file *s = file->private_data;
++	struct nss_core *core = s->private;
++	struct nss_c2c_tx_msg m = {};
++	u32 test_id;
++	int ret;
++
++	ret = kstrtou32_from_user(buf, count, 0, &test_id);
++	if (ret)
++		return ret;
++	if (!test_id || test_id > 4)
++		return -EINVAL;
++	if (!READ_ONCE(core->c2c_ready))
++		return -ENODEV;
++
++	m.cm.interface = NSS_INTERFACE_C2C_TX;
++	m.cm.type = NSS_C2C_TX_MSG_TYPE_PERFORMANCE_TEST;
++	m.msg.test.test_id = test_id;
++	ret = nss_msg_send(core, &m, offsetof(struct nss_c2c_tx_msg, msg) +
++				     sizeof(m.msg.test));
++
++	return ret ? ret : count;
++}
++
++static const struct file_operations nss_c2c_fops = {
++	.open = nss_c2c_open,
++	.read = seq_read,
++	.write = nss_c2c_write,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
+ static void nss_aux_clocks_put(void *data)
+ {
+ 	struct nss_core *core = data;
+@@ -1486,6 +1700,9 @@ static int nss_probe(struct platform_device *pdev)
+ 	ret = of_property_read_u32(dev->of_node, "qcom,id", &core->id);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "no qcom,id\n");
++	if (core->id >= NSS_MAX_CORES)
++		return dev_err_probe(dev, -EINVAL, "unsupported core id %u\n",
++				     core->id);
+ 
+ 	ret = of_property_read_u32(dev->of_node, "qcom,load-addr", &load_addr);
+ 	if (ret)
+@@ -1497,7 +1714,11 @@ static int nss_probe(struct platform_device *pdev)
+ 		return dev_err_probe(dev, ret, "no qcom,max-frequency\n");
+ 	core->core_rate = rate;
+ 
+-	core->nphys = devm_platform_ioremap_resource_byname(pdev, "nphys");
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "nphys");
++	if (!res)
++		return -ENODEV;
++	core->nphys_base = res->start;
++	core->nphys = devm_ioremap_resource(dev, res);
+ 	if (IS_ERR(core->nphys))
+ 		return PTR_ERR(core->nphys);
+ 
+@@ -1547,17 +1768,26 @@ static int nss_probe(struct platform_device *pdev)
+ 		return dev_err_probe(dev, -ERANGE,
+ 				     "load address is outside the region\n");
+ 
+-	/* Whatever ran before this driver, the block is reset before a boot. */
+-	core->conduit = nss_conduit_get();
+-	if (!core->conduit)
+-		return dev_err_probe(dev, -EPROBE_DEFER, "no EDMA conduit\n");
+-	core->edma_stale = true;
++	if (core->id == 0) {
++		/* Whatever ran before this driver, the block is reset before a
++		 * boot.
++		 */
++		core->conduit = nss_conduit_get();
++		if (!core->conduit)
++			return dev_err_probe(dev, -EPROBE_DEFER,
++					     "no EDMA conduit\n");
++		core->edma_stale = true;
++	}
+ 
+ 	platform_set_drvdata(pdev, core);
+-	nss_wifili_bind(core);
+-	nss_flow_bind(core);
+-	nss_mc_bind(core);
+-	nss_redir_bind(core);
++	WRITE_ONCE(nss_cores[core->id], core);
++
++	if (core->id == 0) {
++		nss_wifili_bind(core);
++		nss_flow_bind(core);
++		nss_mc_bind(core);
++		nss_redir_bind(core);
++	}
+ 
+ 	core->debugfs = debugfs_create_dir(dev_name(dev), NULL);
+ 	debugfs_create_file("boot", 0600, core->debugfs, core, &nss_boot_fops);
+@@ -1566,27 +1796,30 @@ static int nss_probe(struct platform_device *pdev)
+ 	debugfs_create_file("msg_probe", 0400, core->debugfs, core,
+ 			    &nss_probe_fops);
+ 	debugfs_create_file("rx", 0400, core->debugfs, core, &nss_rx_fops);
+-	debugfs_create_file("wifili_start", 0400, core->debugfs, core,
+-			    &nss_wifili_fops);
+ 	debugfs_create_file("msgs", 0400, core->debugfs, core, &nss_msgs_fops);
+-	debugfs_create_file("wifili_rx", 0400, core->debugfs, core,
+-			    &nss_wifili_rx_fops);
+-	debugfs_create_file("wifili_tx", 0400, core->debugfs, core,
+-			    &nss_wifili_tx_fops);
+-	debugfs_create_file("fw_ports", 0600, core->debugfs, core,
+-			    &nss_phys_fops);
+-	debugfs_create_file("flows", 0400, core->debugfs, core,
+-			    &nss_flows_fops);
+-	debugfs_create_file("mcast", 0400, core->debugfs, core,
+-			    &nss_mcast_fops);
+-	debugfs_create_file("wifi_me", 0400, core->debugfs, core,
+-			    &nss_wifi_me_fops);
+-	debugfs_create_file("mesh", 0400, core->debugfs, core,
+-			    &nss_mesh_fops);
+-	debugfs_create_file("redir", 0400, core->debugfs, core,
+-			    &nss_redir_fops);
+-	debugfs_create_file("load", 0400, core->debugfs, core,
+-			    &nss_load_fops);
++	debugfs_create_file("load", 0400, core->debugfs, core, &nss_load_fops);
++	debugfs_create_file("c2c", 0600, core->debugfs, core, &nss_c2c_fops);
++
++	if (core->id == 0) {
++		debugfs_create_file("wifili_start", 0400, core->debugfs, core,
++				    &nss_wifili_fops);
++		debugfs_create_file("wifili_rx", 0400, core->debugfs, core,
++				    &nss_wifili_rx_fops);
++		debugfs_create_file("wifili_tx", 0400, core->debugfs, core,
++				    &nss_wifili_tx_fops);
++		debugfs_create_file("fw_ports", 0600, core->debugfs, core,
++				    &nss_phys_fops);
++		debugfs_create_file("flows", 0400, core->debugfs, core,
++				    &nss_flows_fops);
++		debugfs_create_file("mcast", 0400, core->debugfs, core,
++				    &nss_mcast_fops);
++		debugfs_create_file("wifi_me", 0400, core->debugfs, core,
++				    &nss_wifi_me_fops);
++		debugfs_create_file("mesh", 0400, core->debugfs, core,
++				    &nss_mesh_fops);
++		debugfs_create_file("redir", 0400, core->debugfs, core,
++				    &nss_redir_fops);
++	}
+ 
+ 	return 0;
+ }
+@@ -1595,21 +1828,29 @@ static void nss_remove(struct platform_device *pdev)
+ {
+ 	struct nss_core *core = platform_get_drvdata(pdev);
+ 
+-	nss_wifili_bind(NULL);
+-	nss_flow_bind(NULL);
+-	nss_mc_bind(NULL);
++	scoped_guard(mutex, &nss_c2c_lock)
++		WRITE_ONCE(nss_cores[core->id], NULL);
++
++	if (core->id == 0) {
++		nss_wifili_bind(NULL);
++		nss_flow_bind(NULL);
++		nss_mc_bind(NULL);
++	}
+ 	debugfs_remove_recursive(core->debugfs);
+ 	WRITE_ONCE(core->up, false);
+ 	scoped_guard(mutex, &core->lock)
+ 		nss_core_halt(core);
+-	nss_wifili_halted(core);
++	if (core->id == 0)
++		nss_wifili_halted(core);
+ 	cancel_work_sync(&core->restart);
+ 	complete_all(&core->resumed);
+-	flush_work(&core->arm);
+-	flush_work(&core->edma_reset);
+-	/* After the halt, which forgets the bound core's node pairs. */
+-	nss_redir_bind(NULL);
+-	dev_put(core->conduit);
++	if (core->id == 0) {
++		flush_work(&core->arm);
++		flush_work(&core->edma_reset);
++		/* After the halt, which forgets the bound core's node pairs. */
++		nss_redir_bind(NULL);
++		dev_put(core->conduit);
++	}
+ 	nss_clocks_disable(core);
+ }
+ 
+diff --git a/package/kernel/nss-wifi-drv/src/nss_drv.h b/package/kernel/nss-wifi-drv/src/nss_drv.h
+index 0dbaca5bb4..1e886e6bb3 100644
+--- a/package/kernel/nss-wifi-drv/src/nss_drv.h
++++ b/package/kernel/nss-wifi-drv/src/nss_drv.h
+@@ -71,7 +71,9 @@
+ /* The buffer may be kept rather than handed straight back. */
+ #define NSS_H2N_FLAG_BUFFER_REUSABLE	0x8000
+ 
+-unsigned int nss_pool_ceiling(void);
++struct nss_core;
++
++unsigned int nss_pool_ceiling(const struct nss_core *core);
+ 
+ /* The firmware chooses its own offset inside a receive buffer, so the buffer
+  * it is given is the head of the allocation and it reports where the payload
+@@ -81,12 +83,20 @@ unsigned int nss_pool_ceiling(void);
+ #define NSS_EMPTY_BUFFER_ALLOC	(NSS_EMPTY_BUFFER_SIZE + NET_SKB_PAD)
+ 
+ /* Interface numbers the firmware dispatches on. */
++#define NSS_MAX_CORES		2
+ #define NSS_INTERFACE_N2H	156
+ #define NSS_INTERFACE_ETH_RX	158
+ #define NSS_INTERFACE_IPV4	161
+ #define NSS_INTERFACE_IPV6	163
++#define NSS_INTERFACE_CRYPTO	167
++#define NSS_INTERFACE_C2C_TX	168
++#define NSS_INTERFACE_C2C_RX	169
++#define NSS_INTERFACE_IPSEC	174
+ #define NSS_INTERFACE_COREFREQ	175
+ #define NSS_INTERFACE_DYNAMIC	176
++#define NSS_INTERFACE_COREID_SHIFT	24
++#define NSS_INTERFACE_WITH_COREID(core_id, ifnum) \
++	((u32)(ifnum) | (((u32)(core_id) + 1) << NSS_INTERFACE_COREID_SHIFT))
+ /* The base virtual-device node, where the firmware keeps settings that
+  * belong to every virtual device rather than to one of them.
+  */
+@@ -366,6 +376,7 @@ struct nss_core {
+ 	const struct nss_soc *soc;
+ 	const struct nss_fw_line *fw;
+ 	void __iomem *nphys;
++	phys_addr_t nphys_base;
+ 	void __iomem *qgic;
+ 	void __iomem *imem;
+ 	void __iomem *misc_reset;
+@@ -463,6 +474,12 @@ struct nss_core {
+ 	u32 load_inst_max;
+ 	u32 load_samples;
+ 
++	/* Core-to-core (C2C) queue address and state. */
++	u32 c2c_start_dma;
++	bool c2c_ready;
++	u64 c2c_tx_pkts;
++	u64 c2c_rx_pkts;
++
+ 	struct clk_bulk_data clks[];
+ };
+ 
+@@ -476,8 +493,11 @@ void nss_pbuf_pool_free(struct nss_core *core);
+ void nss_core_stop(struct nss_core *core);
+ void nss_core_fault(struct nss_core *core);
+ void nss_core_resume(struct nss_core *core);
++struct nss_core *nss_core_get(u32 id);
+ void nss_core_load_notify(struct nss_core *core, const struct nss_cmn_msg *ncm,
+ 			  u32 len);
++void nss_c2c_notify(struct nss_core *core, const struct nss_cmn_msg *ncm,
++		    u32 len);
+ int nss_rings_start(struct nss_core *core);
+ void nss_iface_bind(struct nss_core *core);
+ void nss_iface_unbind(struct nss_core *core);
+diff --git a/package/kernel/nss-wifi-drv/src/nss_meminfo.c b/package/kernel/nss-wifi-drv/src/nss_meminfo.c
+index ca6099b670..90896c4cfa 100644
+--- a/package/kernel/nss-wifi-drv/src/nss_meminfo.c
++++ b/package/kernel/nss-wifi-drv/src/nss_meminfo.c
+@@ -93,6 +93,7 @@ void nss_mem_free_all(struct nss_core *core)
+ 	core->if_map = NULL;
+ 	core->log = NULL;
+ 	core->log_entries = 0;
++	core->c2c_start_dma = 0;
+ }
+ 
+ /* IMEM is handed out by bumping a pointer through the window the core boots
+@@ -167,6 +168,8 @@ static int nss_meminfo_satisfy(struct nss_core *core, void __iomem *r)
+ 			return ret;
+ 		}
+ 		writel(addr, r + REQ_ADDR);
++		if (!strcmp(name, "c2c_descs_if_mem_map"))
++			core->c2c_start_dma = addr;
+ 		return 0;
+ 	case NSS_MEMINFO_MEMTYPE_SDRAM:
+ 		cpu = nss_mem_alloc(core, size, align, &addr);
+@@ -216,6 +219,8 @@ static int nss_meminfo_satisfy(struct nss_core *core, void __iomem *r)
+ 		 */
+ 		core->log_entries = (size - sizeof(struct nss_log_descriptor)) /
+ 				    sizeof(struct nss_log_entry);
++	} else if (!strcmp(name, "c2c_descs_if_mem_map")) {
++		core->c2c_start_dma = addr;
+ 	}
+ 
+ 	dev_dbg(core->dev, "meminfo %s: %u bytes at %#x\n", name, size, addr);
+diff --git a/package/kernel/nss-wifi-drv/src/nss_msg.c b/package/kernel/nss-wifi-drv/src/nss_msg.c
+index 33ec53a945..bc3aab2aec 100644
+--- a/package/kernel/nss-wifi-drv/src/nss_msg.c
++++ b/package/kernel/nss-wifi-drv/src/nss_msg.c
+@@ -314,6 +314,9 @@ int nss_msg_probe(struct nss_core *core, struct seq_file *s)
+ 	nss_alloc_probe(core, s, NSS_DYNAMIC_INTERFACE_TYPE_GENERIC_REDIR_H2N,
+ 			"redir h2n");
+ 
++	if (core->id != 0)
++		return 0;
++
+ 	return nss_wifili_probe(core, s);
+ }
+ 
+diff --git a/package/kernel/nss-wifi-drv/src/nss_ring.c b/package/kernel/nss-wifi-drv/src/nss_ring.c
+index ada234ef6b..af2970bf19 100644
+--- a/package/kernel/nss-wifi-drv/src/nss_ring.c
++++ b/package/kernel/nss-wifi-drv/src/nss_ring.c
+@@ -177,6 +177,11 @@ static void nss_notify_recv(struct nss_core *core,
+ 	nss_msg_seen(core, ncm, desc->payload_len);
+ 	nss_msg_census(ncm);
+ 	nss_core_load_notify(core, ncm, desc->payload_len);
++	nss_c2c_notify(core, ncm, desc->payload_len);
++
++	if (core->id != 0)
++		return;
++
+ 	nss_flow_notify(ncm, desc->payload_len);
+ 
+ 	if (nss_wifili_is_soc(ncm->interface))
+@@ -899,7 +904,7 @@ int nss_rings_start(struct nss_core *core)
+ 	/* Empty buffers fill the table up to the pool ceiling, so transmitted
+ 	 * frames need room of their own beside them.
+ 	 */
+-	ret = nss_lent_init(core, 2 * nss_pool_ceiling());
++	ret = nss_lent_init(core, 2 * nss_pool_ceiling(core));
+ 	if (ret)
+ 		goto err;
+ 
+diff --git a/target/linux/qualcommax/dts/ipq8174-mx4300.dts b/target/linux/qualcommax/dts/ipq8174-mx4300.dts
+index 356c0f8773..23db9e25ef 100644
+--- a/target/linux/qualcommax/dts/ipq8174-mx4300.dts
++++ b/target/linux/qualcommax/dts/ipq8174-mx4300.dts
+@@ -316,6 +316,15 @@
+ 	qcom,calibration-variant = "Linksys-MX4200v1";
+ };
+ 
++&nss1 {
++	qcom,low-frequency = <187200000>;
++	qcom,mid-frequency = <748800000>;
++	qcom,max-frequency = <1689600000>;
++	mx-supply = <&nss_dummy_reg>;
++	npu-supply = <&nss_dummy_reg>;
++	status = "okay";
++};
++
+ /*
+  * CPU overclocking, off by default. The IPQ8174's own CPU PLL stops at
+  * 1401.6 MHz; faster speeds come from GCC's GPLL2 (see the clk-qcom
+-- 
+2.56.1
+

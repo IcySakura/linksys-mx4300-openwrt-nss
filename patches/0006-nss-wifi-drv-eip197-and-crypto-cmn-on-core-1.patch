@@ -1,0 +1,1210 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Myles Liu <lyx981mike@gmail.com>
+Date: Thu, 26 Nov 2026 13:24:03 -0800
+Subject: [PATCH] nss-wifi-drv: initialize EIP-197 and nss_crypto_cmn on Core 1
+
+Add the MX4300 EIP-197 DT node (0x39880000, crypto clocks) and implement EIP-197 hardware initialization (reset, HIA/PE/FRC/TRC/FLUE setup, kernel CSPRNG seeding, ifpp/ipue/ofpp/opue firmware loading) and Core 1 nss_crypto_cmn context management with /sys/kernel/debug/39400000.nss/crypto diagnostics.
+---
+ package/kernel/nss-wifi-drv/src/Makefile      |   6 +-
+ package/kernel/nss-wifi-drv/src/nss_core.c    |  23 +-
+ package/kernel/nss-wifi-drv/src/nss_crypto.c  | 988 ++++++++++++++++++
+ package/kernel/nss-wifi-drv/src/nss_crypto.h  |  60 ++
+ package/kernel/nss-wifi-drv/src/nss_ring.c    |   2 +
+ .../linux/qualcommax/dts/ipq8174-mx4300.dts   |  13 +
+ 6 files changed, 1088 insertions(+), 4 deletions(-)
+ create mode 100644 package/kernel/nss-wifi-drv/src/nss_crypto.c
+ create mode 100644 package/kernel/nss-wifi-drv/src/nss_crypto.h
+
+diff --git a/package/kernel/nss-wifi-drv/src/Makefile b/package/kernel/nss-wifi-drv/src/Makefile
+index 75968008a3..13f156d63d 100644
+--- a/package/kernel/nss-wifi-drv/src/Makefile
++++ b/package/kernel/nss-wifi-drv/src/Makefile
+@@ -1,8 +1,8 @@
+ obj-m += nss-wifi-drv.o
+ 
+-nss-wifi-drv-objs := nss_bridge.o nss_core.o nss_flow.o nss_mc.o nss_meminfo.o \
+-		     nss_mesh.o nss_msg.o nss_phys.o nss_redir.o nss_ring.o \
+-		     nss_wifili.o
++nss-wifi-drv-objs := nss_bridge.o nss_core.o nss_crypto.o nss_flow.o nss_mc.o \
++		     nss_meminfo.o nss_mesh.o nss_msg.o nss_phys.o \
++		     nss_redir.o nss_ring.o nss_wifili.o
+ 
+ ccflags-y += -I$(src)/include
+ ccflags-y += -DCONFIG_NSS_WIFI_DRV=1
+diff --git a/package/kernel/nss-wifi-drv/src/nss_core.c b/package/kernel/nss-wifi-drv/src/nss_core.c
+index bc1ef8a295..a3ed74b67d 100644
+--- a/package/kernel/nss-wifi-drv/src/nss_core.c
++++ b/package/kernel/nss-wifi-drv/src/nss_core.c
+@@ -36,6 +36,7 @@
+ #include <linux/soc/qcom/qca_ppe.h>
+ 
+ #include "nss_drv.h"
++#include "nss_crypto.h"
+ 
+ /* Core control registers, in the "nphys" range. */
+ #define NSS_CORE_RESET_CTRL		0x0004
+@@ -481,6 +482,9 @@ static void nss_core_halt(struct nss_core *core)
+ 	if (peer)
+ 		WRITE_ONCE(peer->c2c_ready, false);
+ 
++	if (core->id == 1)
++		nss_crypto_stop(core);
++
+ 	if (core->id == 0)
+ 		qca_ppe_fw_carrier_set(core->conduit, NULL);
+ 	writel(1, core->nphys + NSS_CORE_RESET_CTRL);
+@@ -1175,8 +1179,11 @@ static void nss_core_restart(struct work_struct *work)
+ 	scoped_guard(mutex, &core->lock)
+ 		if (READ_ONCE(core->up) && !core->loaded)
+ 			ret = nss_core_boot(core);
+-	if (!ret && READ_ONCE(core->running))
++	if (!ret && READ_ONCE(core->running)) {
+ 		nss_c2c_try_setup();
++		if (core->id == 1)
++			nss_crypto_start(core);
++	}
+ 	/* After a fault the radios' interfaces are registered with the dead
+ 	 * instance; after a WLAN reset they are about to register again.
+ 	 */
+@@ -1227,6 +1234,9 @@ static int nss_boot_set(void *data, u64 val)
+ 
+ 	nss_c2c_try_setup();
+ 
++	if (core->id == 1)
++		nss_crypto_start(core);
++
+ 	if (core->id == 0) {
+ 		nss_phys_arm_ports(core);
+ 		/* The radios' interfaces registered with the last instance. */
+@@ -1580,6 +1590,13 @@ static const struct file_operations nss_c2c_fops = {
+ 	.release = single_release,
+ };
+ 
++static int nss_crypto_show(struct seq_file *s, void *unused)
++{
++	nss_crypto_print(s);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(nss_crypto);
++
+ static void nss_aux_clocks_put(void *data)
+ {
+ 	struct nss_core *core = data;
+@@ -1800,6 +1817,10 @@ static int nss_probe(struct platform_device *pdev)
+ 	debugfs_create_file("load", 0400, core->debugfs, core, &nss_load_fops);
+ 	debugfs_create_file("c2c", 0600, core->debugfs, core, &nss_c2c_fops);
+ 
++	if (core->id == 1)
++		debugfs_create_file("crypto", 0400, core->debugfs, core,
++				    &nss_crypto_fops);
++
+ 	if (core->id == 0) {
+ 		debugfs_create_file("wifili_start", 0400, core->debugfs, core,
+ 				    &nss_wifili_fops);
+diff --git a/package/kernel/nss-wifi-drv/src/nss_crypto.c b/package/kernel/nss-wifi-drv/src/nss_crypto.c
+new file mode 100644
+index 0000000000..6db7c4cdc4
+--- /dev/null
++++ b/package/kernel/nss-wifi-drv/src/nss_crypto.c
+@@ -0,0 +1,988 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* EIP-197 hardware initialization and Core 1 nss_crypto_cmn management.
++ *
++ * The IPQ8074/IPQ8174 EIP-197 packet engine sits at 0x39880000 and is driven
++ * directly by NSS Core 1's crypto_cmn firmware node. The host's job is small:
++ * enable its clocks, reset and initialize the HIA/PE/FRC/TRC/FLUE registers,
++ * load the four classification micro-firmwares (ifpp, ipue, ofpp, opue), and
++ * exchange SETUP_NODE / SETUP_ENG / SETUP_DMA / SETUP_CTX / CLEAR_CTX control
++ * messages with Core 1.
++ */
++
++#include <linux/bitmap.h>
++#include <linux/cleanup.h>
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/firmware.h>
++#include <linux/io.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/random.h>
++#include <linux/seq_file.h>
++
++#include "nss_drv.h"
++#include "nss_crypto.h"
++
++/* EIP-197 engine register offsets relative to 0x39880000. */
++#define EIP197_ENGINE_UID		0x80000
++#define EIP197_DMA_MASK_DEFAULT		0xff
++#define EIP197_MAX_CTX_SIZE		32
++
++#define EIP197_HIA_DFE_CFG		0x0c000
++#define EIP197_HIA_DFE_THR_CTRL		0x0c040
++#define EIP197_HIA_DFE_THR_STAT		0x0c044
++#define EIP197_HIA_DSE_CFG		0x0d000
++#define EIP197_HIA_DSE_THR_CTRL		0x0d040
++#define EIP197_HIA_DSE_THR_STAT		0x0d044
++
++#define EIP197_HIA_RA_PRIO0		0x10000
++#define EIP197_HIA_RA_PRIO1		0x10004
++#define EIP197_HIA_RA_PRIO2		0x10008
++#define EIP197_HIA_RA_PE_CTRL		0x10010
++
++#define EIP197_HIA_AIC_R3_ENABLE	0x1b808
++#define EIP197_HIA_AIC_R3_ACK		0x1b810
++#define EIP197_HIA_AIC_R2_ENABLE	0x1c808
++#define EIP197_HIA_AIC_R2_ACK		0x1c810
++#define EIP197_HIA_AIC_R1_ENABLE	0x1d808
++#define EIP197_HIA_AIC_R1_ACK		0x1d810
++#define EIP197_HIA_AIC_R0_ENABLE	0x1e808
++#define EIP197_HIA_AIC_R0_ACK		0x1e810
++#define EIP197_HIA_AIC_G_ENABLE		0x1f808
++#define EIP197_HIA_AIC_G_ACK		0x1f810
++
++#define EIP197_HIA_LASIDE_BASE_LO	0x1ff00
++#define EIP197_HIA_LASIDE_BASE_HI	0x1ff04
++#define EIP197_HIA_LASIDE_SLAVE_CTRL0	0x1ff08
++#define EIP197_HIA_LASIDE_MASTER_CTRL1	0x1ff0c
++#define EIP197_HIA_INLINE_CTRL0		0x1ff80
++
++#define EIP197_PE_IN_DBUF_THR		0x20000
++#define EIP197_PE_IN_TBUF_THR		0x20100
++#define EIP197_PE_ICE_SCRATCH_RAM	0x20800
++#define EIP197_METADATA_EN_OFFSET	0x20860
++#define EIP197_PE_ICE_PUE_CTRL		0x20c80
++#define EIP197_PE_ICE_SCRATCH_CTRL	0x20d04
++#define EIP197_PE_ICE_FPP_CTRL		0x20d80
++#define EIP197_PE_ICE_RAM_CTRL		0x20ff0
++
++#define EIP197_PE_EIP96_TOKEN_CTRL	0x21000
++#define EIP197_PE_EIP96_OUT_BUF_CTRL	0x2101c
++#define EIP197_PE_EIP96_PRNG_CTRL	0x21044
++#define EIP197_PE_EIP96_PRNG_SEED_LO	0x21048
++#define EIP197_PE_EIP96_PRNG_SEED_HI	0x2104c
++#define EIP197_PE_EIP96_PRNG_KEY0_LO	0x21050
++#define EIP197_PE_EIP96_PRNG_KEY0_HI	0x21054
++#define EIP197_PE_EIP96_PRNG_KEY1_LO	0x21058
++#define EIP197_PE_EIP96_PRNG_KEY1_HI	0x2105c
++#define EIP197_PE_EIP96_LFSR_LO		0x21070
++#define EIP197_PE_EIP96_LFSR_HI		0x21074
++
++#define EIP197_PE_OCE_SCRATCH_RAM	0x21400
++#define EIP197_PE_OCE_PUE_CTRL		0x21880
++#define EIP197_PE_OCE_SCRATCH_CTRL	0x21904
++#define EIP197_PE_OCE_FPP_CTRL		0x21980
++#define EIP197_PE_OCE_RAM_CTRL		0x21bf0
++#define EIP197_PE_OUT_DBUF_THRES	0x21c00
++
++#define EIP197_CS_RAM_START		0x60000
++#define EIP197_FRC_PARAMS		0x70020
++#define EIP197_FRC_FREECHAIN		0x70024
++#define EIP197_FRC_PARAMS2		0x70028
++#define EIP197_FRC_ECCCTRL		0x70030
++#define EIP197_TRC_PARAMS		0x70820
++#define EIP197_TRC_FREECHAIN		0x70824
++#define EIP197_TRC_PARAMS2		0x70828
++#define EIP197_FLUE_CONFIG0		0x76010
++#define EIP197_FLUE_OFFSET		0x76808
++#define EIP197_FLUE_IFC_LUT0		0x76820
++#define EIP197_FLUE_IFC_LUT1		0x76824
++#define EIP197_FLUE_IFC_LUT2		0x76828
++#define EIP197_FHASH_IV0		0x768c0
++#define EIP197_FHASH_IV1		0x768c4
++#define EIP197_FHASH_IV2		0x768c8
++#define EIP197_FHASH_IV3		0x768cc
++#define EIP197_CS_RAM_CTRL		0x77ff0
++#define EIP197_MST_CTRL			0x7fff4
++#define EIP197_VERSION			0x7fffc
++
++/* Hardware init register values from IPQ807x EIP-197 HAL. */
++#define EIP197_HIA_RST			BIT(31)
++#define EIP197_DFE_RST_DONE		0x4f000
++#define EIP197_DSE_RST_DONE		0x0f000
++#define EIP197_DFE_CFG			0xa7250935
++#define EIP197_DSE_CFG_RST		(BIT(31) | BIT(15))
++#define EIP197_DSE_CFG			(BIT(31) | BIT(15) | (0x8 << 8) | 0x10 | 0x7)
++#define EIP197_ENB_DSE_THREAD		BIT(30)
++#define EIP197_HIA_CFG			0xfe000022
++#define EIP197_INLINE_CFG		0x00387000
++#define EIP197_ENB_ALL_RINGS		0x400002ff
++#define EIP197_TOKEN_CTRL_RST		0x00004004
++#define EIP197_TOKEN_CFG		0x00404004
++#define EIP197_INDATA_THR		((0x9 << 12) | (0x5 << 8))
++#define EIP197_INTOKEN_THR		((0x7 << 12) | (0x5 << 8))
++#define EIP197_OUTDATA_THR		((0x8 << 4) | 0x7)
++#define EIP197_PRNG_CTRL_EN		0x3
++#define EIP197_ENB_SCRATCH_RAM		0x031f020c
++#define EIP197_MAX_SCRATCH_RAM		0x1f
++#define EIP197_RST_PE			0xc001
++#define EIP197_ENB_PUE			0x1
++#define EIP197_ENB_FPP			0x2
++#define EIP197_ENB_MDATA		0x1
++
++#define EIP197_MAX_FLOW_REC		0x1b
++#define EIP197_MAX_TRANS_REC		0x1b
++#define EIP197_MAX_FRC_BUCKETS		0x3c
++#define EIP197_MAX_TRC_BUCKETS		0x40
++#define EIP197_EMPTY_REC		0x3ff
++#define EIP197_RST_HASH_COL		0xfffff000
++#define EIP197_FRC_FREECHAIN_CFG	((EIP197_MAX_FLOW_REC - 1) << 16)
++#define EIP197_FRC_PARAMS2_CFG		(0x00401c00 | EIP197_MAX_FLOW_REC)
++#define EIP197_FRC_PARAMS_CFG		(0x00000400 | BIT(6))
++#define EIP197_TRC_FREECHAIN_CFG	((EIP197_MAX_TRANS_REC - 1) << 16)
++#define EIP197_TRC_PARAMS2_CFG		(0x01001c00 | EIP197_MAX_TRANS_REC)
++#define EIP197_TRC_PARAMS_CFG		(0x01400400 | BIT(5))
++#define EIP197_FHASH_IV0_CFG		0x28e1d20f
++#define EIP197_FHASH_IV1_CFG		0x30507ca5
++#define EIP197_FHASH_IV2_CFG		0x084484f1
++#define EIP197_FHASH_IV3_CFG		0xb8a5aeab
++#define EIP197_ENB_FLUE			0xc0000000
++#define EIP197_FLUE_OFFSET_CFG		0x00400004
++
++/* EIP-197 context control words. */
++#define EIP197_CTX_WITH_KEY		BIT(16)
++#define EIP197_CTX_ALGO_3DES		(0x2 << 17)
++#define EIP197_CTX_ALGO_AES128		(0x5 << 17)
++#define EIP197_CTX_ALGO_AES192		(0x6 << 17)
++#define EIP197_CTX_ALGO_AES256		(0x7 << 17)
++#define EIP197_CTX_AUTH_GMAC		(0x2 << 21)
++#define EIP197_CTX_AUTH_HMAC		(0x3 << 21)
++#define EIP197_CTX_ALGO_MD5		(0x0 << 23)
++#define EIP197_CTX_ALGO_SHA1		(0x2 << 23)
++#define EIP197_CTX_ALGO_SHA256		(0x3 << 23)
++#define EIP197_CTX_ALGO_GHASH		(0x4 << 23)
++#define EIP197_CTX_ALGO_SHA512		(0x5 << 23)
++#define EIP197_CTX_ALGO_SHA384		(0x6 << 23)
++#define EIP197_CTX_MODE_CBC		0x1
++#define EIP197_CTX_MODE_GCM		(BIT(17) | 0x2)
++#define EIP197_CTX_WORDS(n)		((n) << 8)
++
++/* nss_crypto_cmn wire protocol. */
++#define NSS_CRYPTO_CMN_CTX_SPARE	4
++#define NSS_CRYPTO_CMN_VER_WORDS	4
++
++enum nss_crypto_cmn_msg_type {
++	NSS_CRYPTO_CMN_MSG_SETUP_NODE		= 1,
++	NSS_CRYPTO_CMN_MSG_SETUP_ENG		= 2,
++	NSS_CRYPTO_CMN_MSG_SETUP_DMA		= 3,
++	NSS_CRYPTO_CMN_MSG_SETUP_CTX		= 4,
++	NSS_CRYPTO_CMN_MSG_CLEAR_CTX		= 5,
++	NSS_CRYPTO_CMN_MSG_VERIFY_CTX		= 6,
++	NSS_CRYPTO_CMN_MSG_SYNC_NODE_STATS	= 7,
++	NSS_CRYPTO_CMN_MSG_SYNC_ENG_STATS	= 8,
++	NSS_CRYPTO_CMN_MSG_SYNC_CTX_STATS	= 9,
++};
++
++#define NSS_CRYPTO_CMN_CTX_FLAG_SPARE0	0x02
++#define NSS_CRYPTO_CMN_CTX_FLAG_SPARE1	0x04
++
++struct nss_crypto_cmn_node {
++	u32 max_dma_rings;
++	u32 max_ctx;
++	u32 max_ctx_size;
++};
++
++struct nss_crypto_cmn_engine {
++	u32 fw_ver[NSS_CRYPTO_CMN_VER_WORDS];
++	u32 dma_mask;
++	u32 req_count;
++};
++
++struct nss_crypto_cmn_dma {
++	u16 pair_id;
++};
++
++struct nss_crypto_cmn_ctx {
++	u32 spare[NSS_CRYPTO_CMN_CTX_SPARE];
++	u16 index;
++	u16 sec_offset;
++	u8 cipher_key[NSS_CRYPTO_CIPHER_KEYLEN_MAX];
++	u8 auth_key[NSS_CRYPTO_AUTH_KEYLEN_MAX];
++	u8 nonce[NSS_CRYPTO_NONCE_SIZE_MAX];
++	u16 auth_keylen;
++	u8 res[2];
++	u32 algo;
++	u32 flags;
++};
++
++struct nss_crypto_cmn_stats {
++	struct nss_cmn_node_stats nstats;
++	u32 fail_version;
++	u32 fail_ctx;
++	u32 fail_dma;
++};
++
++struct nss_crypto_cmn_msg {
++	struct nss_cmn_msg cm;
++	u32 seq_num;
++	u32 uid;
++	union {
++		struct nss_crypto_cmn_node node;
++		struct nss_crypto_cmn_engine eng;
++		struct nss_crypto_cmn_dma dma;
++		struct nss_crypto_cmn_ctx ctx;
++		struct nss_crypto_cmn_stats stats;
++	} msg;
++};
++
++struct nss_crypto_ctrl_words {
++	u32 ctrl[2];
++	bool valid;
++};
++
++static const struct nss_crypto_ctrl_words nss_crypto_ctx_ctrl[] = {
++	[NSS_CRYPTO_ALGO_AES128_GCM_GMAC] = {
++		.ctrl = { EIP197_CTX_WITH_KEY | EIP197_CTX_ALGO_AES128 |
++			  EIP197_CTX_ALGO_GHASH | EIP197_CTX_AUTH_GMAC |
++			  EIP197_CTX_WORDS(8),
++			  EIP197_CTX_MODE_GCM },
++		.valid = true,
++	},
++	[NSS_CRYPTO_ALGO_AES192_GCM_GMAC] = {
++		.ctrl = { EIP197_CTX_WITH_KEY | EIP197_CTX_ALGO_AES192 |
++			  EIP197_CTX_ALGO_GHASH | EIP197_CTX_AUTH_GMAC |
++			  EIP197_CTX_WORDS(10),
++			  EIP197_CTX_MODE_GCM },
++		.valid = true,
++	},
++	[NSS_CRYPTO_ALGO_AES256_GCM_GMAC] = {
++		.ctrl = { EIP197_CTX_WITH_KEY | EIP197_CTX_ALGO_AES256 |
++			  EIP197_CTX_ALGO_GHASH | EIP197_CTX_AUTH_GMAC |
++			  EIP197_CTX_WORDS(12),
++			  EIP197_CTX_MODE_GCM },
++		.valid = true,
++	},
++	[NSS_CRYPTO_ALGO_AES128_CBC_MD5_HMAC] = {
++		.ctrl = { EIP197_CTX_WITH_KEY | EIP197_CTX_ALGO_AES128 |
++			  EIP197_CTX_ALGO_MD5 | EIP197_CTX_AUTH_HMAC |
++			  EIP197_CTX_WORDS(12),
++			  EIP197_CTX_MODE_CBC },
++		.valid = true,
++	},
++	[NSS_CRYPTO_ALGO_AES128_CBC_SHA160_HMAC] = {
++		.ctrl = { EIP197_CTX_WITH_KEY | EIP197_CTX_ALGO_AES128 |
++			  EIP197_CTX_ALGO_SHA1 | EIP197_CTX_AUTH_HMAC |
++			  EIP197_CTX_WORDS(14),
++			  EIP197_CTX_MODE_CBC },
++		.valid = true,
++	},
++	[NSS_CRYPTO_ALGO_AES128_CBC_SHA256_HMAC] = {
++		.ctrl = { EIP197_CTX_WITH_KEY | EIP197_CTX_ALGO_AES128 |
++			  EIP197_CTX_ALGO_SHA256 | EIP197_CTX_AUTH_HMAC |
++			  EIP197_CTX_WORDS(20),
++			  EIP197_CTX_MODE_CBC },
++		.valid = true,
++	},
++	[NSS_CRYPTO_ALGO_AES128_CBC_SHA384_HMAC] = {
++		.ctrl = { EIP197_CTX_WITH_KEY | EIP197_CTX_ALGO_AES128 |
++			  EIP197_CTX_ALGO_SHA384 | EIP197_CTX_AUTH_HMAC |
++			  EIP197_CTX_WORDS(36),
++			  EIP197_CTX_MODE_CBC },
++		.valid = true,
++	},
++	[NSS_CRYPTO_ALGO_AES128_CBC_SHA512_HMAC] = {
++		.ctrl = { EIP197_CTX_WITH_KEY | EIP197_CTX_ALGO_AES128 |
++			  EIP197_CTX_ALGO_SHA512 | EIP197_CTX_AUTH_HMAC |
++			  EIP197_CTX_WORDS(36),
++			  EIP197_CTX_MODE_CBC },
++		.valid = true,
++	},
++	[NSS_CRYPTO_ALGO_AES192_CBC_SHA160_HMAC] = {
++		.ctrl = { EIP197_CTX_WITH_KEY | EIP197_CTX_ALGO_AES192 |
++			  EIP197_CTX_ALGO_SHA1 | EIP197_CTX_AUTH_HMAC |
++			  EIP197_CTX_WORDS(16),
++			  EIP197_CTX_MODE_CBC },
++		.valid = true,
++	},
++	[NSS_CRYPTO_ALGO_AES192_CBC_SHA256_HMAC] = {
++		.ctrl = { EIP197_CTX_WITH_KEY | EIP197_CTX_ALGO_AES192 |
++			  EIP197_CTX_ALGO_SHA256 | EIP197_CTX_AUTH_HMAC |
++			  EIP197_CTX_WORDS(22),
++			  EIP197_CTX_MODE_CBC },
++		.valid = true,
++	},
++	[NSS_CRYPTO_ALGO_AES192_CBC_SHA384_HMAC] = {
++		.ctrl = { EIP197_CTX_WITH_KEY | EIP197_CTX_ALGO_AES192 |
++			  EIP197_CTX_ALGO_SHA384 | EIP197_CTX_AUTH_HMAC |
++			  EIP197_CTX_WORDS(38),
++			  EIP197_CTX_MODE_CBC },
++		.valid = true,
++	},
++	[NSS_CRYPTO_ALGO_AES192_CBC_SHA512_HMAC] = {
++		.ctrl = { EIP197_CTX_WITH_KEY | EIP197_CTX_ALGO_AES192 |
++			  EIP197_CTX_ALGO_SHA512 | EIP197_CTX_AUTH_HMAC |
++			  EIP197_CTX_WORDS(38),
++			  EIP197_CTX_MODE_CBC },
++		.valid = true,
++	},
++	[NSS_CRYPTO_ALGO_AES256_CBC_MD5_HMAC] = {
++		.ctrl = { EIP197_CTX_WITH_KEY | EIP197_CTX_ALGO_AES256 |
++			  EIP197_CTX_ALGO_MD5 | EIP197_CTX_AUTH_HMAC |
++			  EIP197_CTX_WORDS(16),
++			  EIP197_CTX_MODE_CBC },
++		.valid = true,
++	},
++	[NSS_CRYPTO_ALGO_AES256_CBC_SHA160_HMAC] = {
++		.ctrl = { EIP197_CTX_WITH_KEY | EIP197_CTX_ALGO_AES256 |
++			  EIP197_CTX_ALGO_SHA1 | EIP197_CTX_AUTH_HMAC |
++			  EIP197_CTX_WORDS(18),
++			  EIP197_CTX_MODE_CBC },
++		.valid = true,
++	},
++	[NSS_CRYPTO_ALGO_AES256_CBC_SHA256_HMAC] = {
++		.ctrl = { EIP197_CTX_WITH_KEY | EIP197_CTX_ALGO_AES256 |
++			  EIP197_CTX_ALGO_SHA256 | EIP197_CTX_AUTH_HMAC |
++			  EIP197_CTX_WORDS(24),
++			  EIP197_CTX_MODE_CBC },
++		.valid = true,
++	},
++	[NSS_CRYPTO_ALGO_AES256_CBC_SHA384_HMAC] = {
++		.ctrl = { EIP197_CTX_WITH_KEY | EIP197_CTX_ALGO_AES256 |
++			  EIP197_CTX_ALGO_SHA384 | EIP197_CTX_AUTH_HMAC |
++			  EIP197_CTX_WORDS(40),
++			  EIP197_CTX_MODE_CBC },
++		.valid = true,
++	},
++	[NSS_CRYPTO_ALGO_AES256_CBC_SHA512_HMAC] = {
++		.ctrl = { EIP197_CTX_WITH_KEY | EIP197_CTX_ALGO_AES256 |
++			  EIP197_CTX_ALGO_SHA512 | EIP197_CTX_AUTH_HMAC |
++			  EIP197_CTX_WORDS(40),
++			  EIP197_CTX_MODE_CBC },
++		.valid = true,
++	},
++	[NSS_CRYPTO_ALGO_3DES_CBC_SHA160_HMAC] = {
++		.ctrl = { EIP197_CTX_WITH_KEY | EIP197_CTX_ALGO_3DES |
++			  EIP197_CTX_ALGO_SHA1 | EIP197_CTX_AUTH_HMAC |
++			  EIP197_CTX_WORDS(16),
++			  EIP197_CTX_MODE_CBC },
++		.valid = true,
++	},
++	[NSS_CRYPTO_ALGO_3DES_CBC_SHA256_HMAC] = {
++		.ctrl = { EIP197_CTX_WITH_KEY | EIP197_CTX_ALGO_3DES |
++			  EIP197_CTX_ALGO_SHA256 | EIP197_CTX_AUTH_HMAC |
++			  EIP197_CTX_WORDS(22),
++			  EIP197_CTX_MODE_CBC },
++		.valid = true,
++	},
++};
++
++struct nss_crypto_state {
++	struct nss_core *core;
++	void __iomem *base;
++	struct clk *clks[3];
++	u32 dma_mask;
++	u32 hw_version;
++	u32 seq;
++	bool ready;
++	DECLARE_BITMAP(ctx_used, NSS_CRYPTO_MAX_CTX);
++
++	u64 rx_pkts;
++	u64 rx_bytes;
++	u64 tx_pkts;
++	u64 tx_bytes;
++	u64 fail_ctx;
++	u64 fail_dma;
++	u64 ctx_allocs;
++	u64 ctx_frees;
++};
++
++static DEFINE_MUTEX(nss_crypto_lock);
++static struct nss_crypto_state nss_crypto;
++
++static const struct {
++	const char *name;
++	unsigned long rate;
++} eip197_clk_cfg[] = {
++	{ "crypto-clk",		600000000 },
++	{ "nssnoc-crypto-clk",	600000000 },
++	{ "crypto-ppe-clk",	0 },
++};
++
++static void eip197_clocks_put(void)
++{
++	int i;
++
++	for (i = ARRAY_SIZE(eip197_clk_cfg) - 1; i >= 0; i--) {
++		if (!nss_crypto.clks[i])
++			continue;
++		clk_disable_unprepare(nss_crypto.clks[i]);
++		clk_put(nss_crypto.clks[i]);
++		nss_crypto.clks[i] = NULL;
++	}
++}
++
++static int eip197_clocks_on(struct device *dev, struct device_node *np)
++{
++	int i, ret;
++
++	for (i = 0; i < ARRAY_SIZE(eip197_clk_cfg); i++) {
++		struct clk *clk = of_clk_get_by_name(np, eip197_clk_cfg[i].name);
++
++		if (IS_ERR(clk)) {
++			ret = PTR_ERR(clk);
++			dev_err(dev, "eip197: clk %s: %d\n",
++				eip197_clk_cfg[i].name, ret);
++			goto err;
++		}
++		if (eip197_clk_cfg[i].rate) {
++			ret = clk_set_rate(clk, eip197_clk_cfg[i].rate);
++			if (ret) {
++				clk_put(clk);
++				dev_err(dev, "eip197: set %s rate %lu: %d\n",
++					eip197_clk_cfg[i].name,
++					eip197_clk_cfg[i].rate, ret);
++				goto err;
++			}
++		}
++		ret = clk_prepare_enable(clk);
++		if (ret) {
++			clk_put(clk);
++			dev_err(dev, "eip197: enable %s: %d\n",
++				eip197_clk_cfg[i].name, ret);
++			goto err;
++		}
++		nss_crypto.clks[i] = clk;
++	}
++
++	return 0;
++
++err:
++	eip197_clocks_put();
++	return ret;
++}
++
++static bool eip197_reset_done(void __iomem *base)
++{
++	if (ioread32(base + EIP197_HIA_DFE_THR_STAT) != EIP197_DFE_RST_DONE)
++		return false;
++	if (ioread32(base + EIP197_HIA_DSE_THR_STAT) != EIP197_DSE_RST_DONE)
++		return false;
++
++	iowrite32(0, base + EIP197_HIA_DFE_THR_CTRL);
++	iowrite32(0, base + EIP197_HIA_DSE_THR_CTRL);
++	return true;
++}
++
++static int eip197_hw_reset(struct device *dev, void __iomem *base)
++{
++	int tries;
++
++	iowrite32(EIP197_HIA_RST, base + EIP197_HIA_DFE_THR_CTRL);
++	iowrite32(0, base + EIP197_HIA_DFE_CFG);
++	iowrite32(0, base + EIP197_HIA_RA_PRIO0);
++	iowrite32(0, base + EIP197_HIA_RA_PRIO1);
++	iowrite32(0, base + EIP197_HIA_RA_PRIO2);
++	iowrite32(EIP197_HIA_RST, base + EIP197_HIA_RA_PE_CTRL);
++	iowrite32(EIP197_HIA_RST, base + EIP197_HIA_DSE_THR_CTRL);
++	iowrite32(EIP197_DSE_CFG_RST, base + EIP197_HIA_DSE_CFG);
++	iowrite32(0, base + EIP197_HIA_LASIDE_BASE_LO);
++	iowrite32(0, base + EIP197_HIA_LASIDE_BASE_HI);
++	iowrite32(0, base + EIP197_HIA_LASIDE_SLAVE_CTRL0);
++	iowrite32(0, base + EIP197_HIA_LASIDE_MASTER_CTRL1);
++	iowrite32(0, base + EIP197_HIA_INLINE_CTRL0);
++	iowrite32(0, base + EIP197_PE_IN_DBUF_THR);
++	iowrite32(0, base + EIP197_PE_IN_TBUF_THR);
++	iowrite32(0, base + EIP197_PE_OUT_DBUF_THRES);
++	iowrite32(EIP197_TOKEN_CTRL_RST, base + EIP197_PE_EIP96_TOKEN_CTRL);
++
++	for (tries = 0; tries < 20; tries++) {
++		msleep(10);
++		if (eip197_reset_done(base))
++			return 0;
++	}
++
++	dev_err(dev, "eip197: reset timed out (DFE %#x DSE %#x)\n",
++		ioread32(base + EIP197_HIA_DFE_THR_STAT),
++		ioread32(base + EIP197_HIA_DSE_THR_STAT));
++	return -ETIMEDOUT;
++}
++
++static u32 eip197_prng_word(void)
++{
++	u32 v = get_random_u32();
++
++	return v ? v : 0x48c24cfd;
++}
++
++static void eip197_hw_setup_core(void __iomem *base)
++{
++	u32 data;
++
++	iowrite32(EIP197_HIA_CFG, base + EIP197_MST_CTRL);
++	iowrite32(EIP197_DFE_CFG, base + EIP197_HIA_DFE_CFG);
++	iowrite32(EIP197_DSE_CFG, base + EIP197_HIA_DSE_CFG);
++	iowrite32(EIP197_INDATA_THR, base + EIP197_PE_IN_DBUF_THR);
++	iowrite32(EIP197_INTOKEN_THR, base + EIP197_PE_IN_TBUF_THR);
++	iowrite32(EIP197_OUTDATA_THR, base + EIP197_PE_OUT_DBUF_THRES);
++
++	iowrite32(EIP197_TOKEN_CFG, base + EIP197_PE_EIP96_TOKEN_CTRL);
++	iowrite32(0, base + EIP197_PE_EIP96_OUT_BUF_CTRL);
++	iowrite32(0, base + EIP197_HIA_LASIDE_BASE_LO);
++	iowrite32(EIP197_HIA_RST, base + EIP197_HIA_LASIDE_SLAVE_CTRL0);
++	iowrite32(EIP197_HIA_RST, base + EIP197_HIA_LASIDE_MASTER_CTRL1);
++	iowrite32(EIP197_INLINE_CFG, base + EIP197_HIA_INLINE_CTRL0);
++	iowrite32(EIP197_ENB_ALL_RINGS, base + EIP197_HIA_RA_PE_CTRL);
++
++	data = ioread32(base + EIP197_HIA_DSE_THR_CTRL);
++	iowrite32(data | EIP197_ENB_DSE_THREAD, base + EIP197_HIA_DSE_THR_CTRL);
++
++	/* Seed EIP-197 hardware PRNG from the kernel CSPRNG. */
++	iowrite32(0, base + EIP197_PE_EIP96_PRNG_CTRL);
++	iowrite32(eip197_prng_word(), base + EIP197_PE_EIP96_PRNG_SEED_LO);
++	iowrite32(eip197_prng_word(), base + EIP197_PE_EIP96_PRNG_SEED_HI);
++	iowrite32(eip197_prng_word(), base + EIP197_PE_EIP96_PRNG_KEY0_LO);
++	iowrite32(eip197_prng_word(), base + EIP197_PE_EIP96_PRNG_KEY0_HI);
++	iowrite32(eip197_prng_word(), base + EIP197_PE_EIP96_PRNG_KEY1_LO);
++	iowrite32(eip197_prng_word(), base + EIP197_PE_EIP96_PRNG_KEY1_HI);
++	iowrite32(eip197_prng_word(), base + EIP197_PE_EIP96_LFSR_LO);
++	iowrite32(eip197_prng_word(), base + EIP197_PE_EIP96_LFSR_HI);
++	iowrite32(EIP197_PRNG_CTRL_EN, base + EIP197_PE_EIP96_PRNG_CTRL);
++
++	/* Disable and ack all HIA interrupts; Core 1 polls its rings. */
++	iowrite32(0, base + EIP197_HIA_AIC_G_ENABLE);
++	iowrite32(U32_MAX, base + EIP197_HIA_AIC_G_ACK);
++	iowrite32(0, base + EIP197_HIA_AIC_R0_ENABLE);
++	iowrite32(0, base + EIP197_HIA_AIC_R1_ENABLE);
++	iowrite32(0, base + EIP197_HIA_AIC_R2_ENABLE);
++	iowrite32(0, base + EIP197_HIA_AIC_R3_ENABLE);
++	iowrite32(U32_MAX, base + EIP197_HIA_AIC_R0_ACK);
++	iowrite32(U32_MAX, base + EIP197_HIA_AIC_R1_ACK);
++	iowrite32(U32_MAX, base + EIP197_HIA_AIC_R2_ACK);
++	iowrite32(U32_MAX, base + EIP197_HIA_AIC_R3_ACK);
++}
++
++static void eip197_init_record_cache(void __iomem *base, u32 max_rec,
++				     u32 max_buckets)
++{
++	void __iomem *addr;
++	u32 i, val;
++
++	for (i = 0; i < max_rec; i++) {
++		addr = base + EIP197_CS_RAM_START + i * 16;
++		if (i == 0)
++			val = (EIP197_EMPTY_REC << 10) | 1;
++		else if (i == max_rec - 1)
++			val = ((i - 1) << 10) | EIP197_EMPTY_REC;
++		else
++			val = ((i - 1) << 10) | (i + 1);
++
++		iowrite32(EIP197_RST_HASH_COL, addr);
++		iowrite32(val, addr + 0x4);
++		iowrite32(0, addr + 0x8);
++		iowrite32(0, addr + 0xc);
++	}
++
++	addr = base + EIP197_CS_RAM_START + max_rec * 16;
++	for (i = 0; i < max_buckets; i++)
++		iowrite32(U32_MAX, addr + i * 4);
++}
++
++static void eip197_hw_setup_cache(void __iomem *base)
++{
++	/* Flow record cache (FRC). */
++	iowrite32(0x1, base + EIP197_CS_RAM_CTRL);
++	iowrite32(0x0, base + EIP197_FRC_ECCCTRL);
++	iowrite32(0x1, base + EIP197_FRC_PARAMS);
++	eip197_init_record_cache(base, EIP197_MAX_FLOW_REC,
++				 EIP197_MAX_FRC_BUCKETS);
++	iowrite32(0x0, base + EIP197_CS_RAM_CTRL);
++	iowrite32(EIP197_FRC_FREECHAIN_CFG, base + EIP197_FRC_FREECHAIN);
++	iowrite32(EIP197_FRC_PARAMS2_CFG, base + EIP197_FRC_PARAMS2);
++	iowrite32(EIP197_FRC_PARAMS_CFG, base + EIP197_FRC_PARAMS);
++
++	/* Transform record cache (TRC). */
++	iowrite32(0x10, base + EIP197_CS_RAM_CTRL);
++	iowrite32(0x1, base + EIP197_TRC_PARAMS);
++	eip197_init_record_cache(base, EIP197_MAX_TRANS_REC,
++				 EIP197_MAX_TRC_BUCKETS);
++	iowrite32(0x0, base + EIP197_CS_RAM_CTRL);
++	iowrite32(EIP197_TRC_FREECHAIN_CFG, base + EIP197_TRC_FREECHAIN);
++	iowrite32(EIP197_TRC_PARAMS2_CFG, base + EIP197_TRC_PARAMS2);
++	iowrite32(EIP197_TRC_PARAMS_CFG, base + EIP197_TRC_PARAMS);
++
++	/* Flow lookup engine (FLUE). */
++	iowrite32(EIP197_FHASH_IV0_CFG, base + EIP197_FHASH_IV0);
++	iowrite32(EIP197_FHASH_IV1_CFG, base + EIP197_FHASH_IV1);
++	iowrite32(EIP197_FHASH_IV2_CFG, base + EIP197_FHASH_IV2);
++	iowrite32(EIP197_FHASH_IV3_CFG, base + EIP197_FHASH_IV3);
++	iowrite32(EIP197_ENB_FLUE, base + EIP197_FLUE_CONFIG0);
++	iowrite32(EIP197_FLUE_OFFSET_CFG, base + EIP197_FLUE_OFFSET);
++	iowrite32(0, base + EIP197_FLUE_IFC_LUT0);
++	iowrite32(0, base + EIP197_FLUE_IFC_LUT1);
++	iowrite32(0, base + EIP197_FLUE_IFC_LUT2);
++}
++
++static void eip197_hw_clear_scratch(void __iomem *base)
++{
++	u32 i;
++
++	iowrite32(EIP197_ENB_SCRATCH_RAM, base + EIP197_PE_ICE_SCRATCH_CTRL);
++	for (i = 0; i < EIP197_MAX_SCRATCH_RAM; i++)
++		iowrite32(0, base + EIP197_PE_ICE_SCRATCH_RAM + i * 4);
++
++	iowrite32(EIP197_ENB_SCRATCH_RAM, base + EIP197_PE_OCE_SCRATCH_CTRL);
++	for (i = 0; i < EIP197_MAX_SCRATCH_RAM; i++)
++		iowrite32(0, base + EIP197_PE_OCE_SCRATCH_RAM + i * 4);
++}
++
++static int eip197_boot_engine(struct device *dev, void __iomem *base,
++			      u32 ctrl_reg, u32 ram_ctrl_reg, u32 ram_en,
++			      const char *fw_name)
++{
++	const struct firmware *fw;
++	const u32 *words;
++	size_t i;
++	int ret;
++
++	ret = request_firmware(&fw, fw_name, dev);
++	if (ret) {
++		dev_err(dev, "eip197: missing firmware %s: %d\n", fw_name, ret);
++		return ret;
++	}
++	if (!fw->size || (fw->size & 3) || fw->size > 0x10000) {
++		dev_err(dev, "eip197: bad firmware %s size %zu\n",
++			fw_name, fw->size);
++		release_firmware(fw);
++		return -EINVAL;
++	}
++
++	iowrite32(EIP197_RST_PE, base + ctrl_reg);
++	iowrite32(ram_en, base + ram_ctrl_reg);
++
++	words = (const u32 *)fw->data;
++	for (i = 0; i < fw->size / 4; i++)
++		iowrite32(words[i], base + EIP197_CS_RAM_START + i * 4);
++
++	iowrite32(0, base + ram_ctrl_reg);
++	iowrite32(0, base + ctrl_reg);
++
++	release_firmware(fw);
++	return 0;
++}
++
++static int eip197_hw_init(struct device *dev, void __iomem *base)
++{
++	int ret;
++
++	ret = eip197_hw_reset(dev, base);
++	if (ret)
++		return ret;
++
++	eip197_hw_setup_core(base);
++	eip197_hw_setup_cache(base);
++	eip197_hw_clear_scratch(base);
++
++	ret = eip197_boot_engine(dev, base, EIP197_PE_ICE_FPP_CTRL,
++				 EIP197_PE_ICE_RAM_CTRL, EIP197_ENB_FPP,
++				 "ifpp.bin");
++	if (ret)
++		return ret;
++	ret = eip197_boot_engine(dev, base, EIP197_PE_ICE_PUE_CTRL,
++				 EIP197_PE_ICE_RAM_CTRL, EIP197_ENB_PUE,
++				 "ipue.bin");
++	if (ret)
++		return ret;
++	ret = eip197_boot_engine(dev, base, EIP197_PE_OCE_FPP_CTRL,
++				 EIP197_PE_OCE_RAM_CTRL, EIP197_ENB_FPP,
++				 "ofpp.bin");
++	if (ret)
++		return ret;
++	ret = eip197_boot_engine(dev, base, EIP197_PE_OCE_PUE_CTRL,
++				 EIP197_PE_OCE_RAM_CTRL, EIP197_ENB_PUE,
++				 "opue.bin");
++	if (ret)
++		return ret;
++
++	/* Enable 16-byte metadata pass-through from input to output. */
++	iowrite32(EIP197_ENB_MDATA, base + EIP197_METADATA_EN_OFFSET);
++	return 0;
++}
++
++static int nss_crypto_send(struct nss_core *core,
++			   struct nss_crypto_cmn_msg *m,
++			   enum nss_crypto_cmn_msg_type type)
++{
++	m->cm.interface = NSS_INTERFACE_CRYPTO;
++	m->cm.type = type;
++	m->seq_num = ++nss_crypto.seq;
++
++	return nss_msg_send(core, m, sizeof(*m));
++}
++
++int nss_crypto_start(struct nss_core *core)
++{
++	struct device_node *np __free(device_node) = NULL;
++	struct nss_crypto_cmn_msg *m __free(kfree) = NULL;
++	struct resource res;
++	unsigned long dma_mask;
++	u32 bit;
++	int ret;
++
++	if (core->id != 1)
++		return 0;
++
++	guard(mutex)(&nss_crypto_lock);
++
++	if (nss_crypto.ready)
++		return 0;
++
++	np = of_find_compatible_node(NULL, NULL, "qcom,ipq8074-eip197");
++	if (!np || !of_device_is_available(np)) {
++		dev_info(core->dev, "eip197: no enabled DT node, crypto off\n");
++		return 0;
++	}
++
++	ret = of_address_to_resource(np, 0, &res);
++	if (ret)
++		return ret;
++
++	ret = eip197_clocks_on(core->dev, np);
++	if (ret)
++		return ret;
++
++	nss_crypto.base = ioremap(res.start, resource_size(&res));
++	if (!nss_crypto.base) {
++		ret = -ENOMEM;
++		goto err_clk;
++	}
++
++	m = kzalloc(sizeof(*m), GFP_KERNEL);
++	if (!m) {
++		ret = -ENOMEM;
++		goto err_map;
++	}
++
++	/* 1. Initialize Core 1 crypto_cmn node. */
++	m->msg.node.max_dma_rings = EIP197_DMA_MASK_DEFAULT;
++	m->msg.node.max_ctx = NSS_CRYPTO_MAX_CTX;
++	m->msg.node.max_ctx_size = EIP197_MAX_CTX_SIZE;
++	ret = nss_crypto_send(core, m, NSS_CRYPTO_CMN_MSG_SETUP_NODE);
++	if (ret) {
++		dev_err(core->dev, "eip197: SETUP_NODE failed: %d (err %u)\n",
++			ret, m->cm.error);
++		goto err_map;
++	}
++
++	/* 2. Reset, configure, and load firmware into EIP-197 hardware. */
++	ret = eip197_hw_init(core->dev, nss_crypto.base);
++	if (ret)
++		goto err_map;
++
++	nss_crypto.hw_version = ioread32(nss_crypto.base + EIP197_VERSION);
++
++	/* 3. Register engine instance with Core 1 and discover its DMA mask. */
++	memset(m, 0, sizeof(*m));
++	m->uid = EIP197_ENGINE_UID;
++	ret = nss_crypto_send(core, m, NSS_CRYPTO_CMN_MSG_SETUP_ENG);
++	if (ret) {
++		dev_err(core->dev, "eip197: SETUP_ENG failed: %d (err %u)\n",
++			ret, m->cm.error);
++		goto err_map;
++	}
++
++	nss_crypto.dma_mask = m->msg.eng.dma_mask;
++	if (!nss_crypto.dma_mask) {
++		dev_err(core->dev, "eip197: firmware reported zero DMA rings\n");
++		ret = -ENOENT;
++		goto err_map;
++	}
++
++	/* 4. Initialize each DMA ring pair reported by firmware. */
++	dma_mask = nss_crypto.dma_mask;
++	for_each_set_bit(bit, &dma_mask, 32) {
++		memset(m, 0, sizeof(*m));
++		m->msg.dma.pair_id = bit;
++		ret = nss_crypto_send(core, m, NSS_CRYPTO_CMN_MSG_SETUP_DMA);
++		if (ret) {
++			dev_err(core->dev,
++				"eip197: SETUP_DMA pair %u failed: %d (err %u)\n",
++				bit, ret, m->cm.error);
++			goto err_map;
++		}
++	}
++
++	bitmap_zero(nss_crypto.ctx_used, NSS_CRYPTO_MAX_CTX);
++	nss_crypto.core = core;
++	WRITE_ONCE(nss_crypto.ready, true);
++
++	dev_info(core->dev,
++		 "eip197 ready: ver %#x dma_mask %#x max_ctx %u\n",
++		 nss_crypto.hw_version, nss_crypto.dma_mask,
++		 NSS_CRYPTO_MAX_CTX);
++
++	return 0;
++
++err_map:
++	iounmap(nss_crypto.base);
++	nss_crypto.base = NULL;
++err_clk:
++	eip197_clocks_put();
++	return ret;
++}
++
++void nss_crypto_stop(struct nss_core *core)
++{
++	if (core->id != 1)
++		return;
++
++	guard(mutex)(&nss_crypto_lock);
++
++	WRITE_ONCE(nss_crypto.ready, false);
++	nss_crypto.core = NULL;
++	nss_crypto.dma_mask = 0;
++	bitmap_zero(nss_crypto.ctx_used, NSS_CRYPTO_MAX_CTX);
++
++	if (nss_crypto.base) {
++		iounmap(nss_crypto.base);
++		nss_crypto.base = NULL;
++	}
++	eip197_clocks_put();
++}
++
++bool nss_crypto_ready(void)
++{
++	return READ_ONCE(nss_crypto.ready);
++}
++
++int nss_crypto_ctx_alloc(const struct nss_crypto_ctx_cfg *cfg, u16 *idx_out)
++{
++	struct nss_crypto_cmn_msg *m __free(kfree) = NULL;
++	unsigned long idx;
++	int ret;
++
++	if (!cfg || !idx_out || cfg->algo >= ARRAY_SIZE(nss_crypto_ctx_ctrl) ||
++	    !nss_crypto_ctx_ctrl[cfg->algo].valid)
++		return -EOPNOTSUPP;
++	if (cfg->cipher_keylen > NSS_CRYPTO_CIPHER_KEYLEN_MAX ||
++	    cfg->auth_keylen > NSS_CRYPTO_AUTH_KEYLEN_MAX ||
++	    cfg->nonce_len > NSS_CRYPTO_NONCE_SIZE_MAX)
++		return -EINVAL;
++
++	guard(mutex)(&nss_crypto_lock);
++
++	if (!nss_crypto.ready || !nss_crypto.core || !nss_crypto.core->running)
++		return -ENODEV;
++
++	idx = find_first_zero_bit(nss_crypto.ctx_used, NSS_CRYPTO_MAX_CTX);
++	if (idx >= NSS_CRYPTO_MAX_CTX)
++		return -ENOSPC;
++
++	m = kzalloc(sizeof(*m), GFP_KERNEL);
++	if (!m)
++		return -ENOMEM;
++
++	m->msg.ctx.spare[0] = nss_crypto_ctx_ctrl[cfg->algo].ctrl[0];
++	m->msg.ctx.spare[1] = nss_crypto_ctx_ctrl[cfg->algo].ctrl[1];
++	m->msg.ctx.index = idx;
++	m->msg.ctx.algo = cfg->algo;
++	m->msg.ctx.auth_keylen = cfg->auth_keylen;
++	m->msg.ctx.flags = NSS_CRYPTO_CMN_CTX_FLAG_SPARE0 |
++			   NSS_CRYPTO_CMN_CTX_FLAG_SPARE1;
++
++	if (cfg->cipher_key && cfg->cipher_keylen)
++		memcpy(m->msg.ctx.cipher_key, cfg->cipher_key,
++		       cfg->cipher_keylen);
++	if (cfg->auth_key && cfg->auth_keylen)
++		memcpy(m->msg.ctx.auth_key, cfg->auth_key, cfg->auth_keylen);
++	if (cfg->nonce && cfg->nonce_len)
++		memcpy(m->msg.ctx.nonce, cfg->nonce, cfg->nonce_len);
++
++	ret = nss_crypto_send(nss_crypto.core, m, NSS_CRYPTO_CMN_MSG_SETUP_CTX);
++	if (ret) {
++		dev_err(nss_crypto.core->dev,
++			"eip197: SETUP_CTX idx %lu algo %u failed: %d (err %u)\n",
++			idx, cfg->algo, ret, m->cm.error);
++		return ret;
++	}
++
++	set_bit(idx, nss_crypto.ctx_used);
++	nss_crypto.ctx_allocs++;
++	*idx_out = idx;
++
++	return 0;
++}
++
++void nss_crypto_ctx_free(u16 idx)
++{
++	struct nss_crypto_cmn_msg *m __free(kfree) = NULL;
++	int tries;
++
++	if (idx >= NSS_CRYPTO_MAX_CTX)
++		return;
++
++	guard(mutex)(&nss_crypto_lock);
++
++	if (!test_bit(idx, nss_crypto.ctx_used))
++		return;
++
++	if (nss_crypto.ready && nss_crypto.core && nss_crypto.core->running) {
++		m = kzalloc(sizeof(*m), GFP_KERNEL);
++		if (m) {
++			enum nss_crypto_cmn_msg_type type =
++				NSS_CRYPTO_CMN_MSG_CLEAR_CTX;
++
++			for (tries = 0; tries < 5; tries++) {
++				memset(m, 0, sizeof(*m));
++				m->msg.ctx.index = idx;
++				if (!nss_crypto_send(nss_crypto.core, m, type))
++					break;
++				type = NSS_CRYPTO_CMN_MSG_VERIFY_CTX;
++				msleep(10);
++			}
++		}
++	}
++
++	clear_bit(idx, nss_crypto.ctx_used);
++	nss_crypto.ctx_frees++;
++}
++
++void nss_crypto_notify(struct nss_core *core, const struct nss_cmn_msg *ncm,
++		       u32 len)
++{
++	const struct nss_crypto_cmn_msg *m;
++
++	if (core->id != 1 ||
++	    NSS_INTERFACE_NUM_GET(ncm->interface) != NSS_INTERFACE_CRYPTO)
++		return;
++	if (ncm->type != NSS_CRYPTO_CMN_MSG_SYNC_NODE_STATS ||
++	    len < offsetofend(struct nss_crypto_cmn_msg, msg.stats))
++		return;
++
++	m = container_of_const(ncm, struct nss_crypto_cmn_msg, cm);
++	nss_crypto.rx_pkts += m->msg.stats.nstats.rx_packets;
++	nss_crypto.rx_bytes += m->msg.stats.nstats.rx_bytes;
++	nss_crypto.tx_pkts += m->msg.stats.nstats.tx_packets;
++	nss_crypto.tx_bytes += m->msg.stats.nstats.tx_bytes;
++	nss_crypto.fail_ctx += m->msg.stats.fail_ctx;
++	nss_crypto.fail_dma += m->msg.stats.fail_dma;
++}
++
++void nss_crypto_print(struct seq_file *s)
++{
++	guard(mutex)(&nss_crypto_lock);
++
++	seq_printf(s, "ready: %u\n", nss_crypto.ready);
++	seq_printf(s, "hw_version: %#x\n", nss_crypto.hw_version);
++	seq_printf(s, "dma_mask: %#x\n", nss_crypto.dma_mask);
++	seq_printf(s, "contexts: %u / %u (alloc %llu free %llu)\n",
++		   bitmap_weight(nss_crypto.ctx_used, NSS_CRYPTO_MAX_CTX),
++		   NSS_CRYPTO_MAX_CTX, nss_crypto.ctx_allocs,
++		   nss_crypto.ctx_frees);
++	seq_printf(s, "rx: %llu pkts %llu bytes\n",
++		   nss_crypto.rx_pkts, nss_crypto.rx_bytes);
++	seq_printf(s, "tx: %llu pkts %llu bytes\n",
++		   nss_crypto.tx_pkts, nss_crypto.tx_bytes);
++	seq_printf(s, "fail: ctx %llu dma %llu\n",
++		   nss_crypto.fail_ctx, nss_crypto.fail_dma);
++}
+diff --git a/package/kernel/nss-wifi-drv/src/nss_crypto.h b/package/kernel/nss-wifi-drv/src/nss_crypto.h
+new file mode 100644
+index 0000000000..31880572c9
+--- /dev/null
++++ b/package/kernel/nss-wifi-drv/src/nss_crypto.h
+@@ -0,0 +1,60 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* EIP-197 hardware crypto engine and Core 1 nss_crypto_cmn interface. */
++
++#ifndef __NSS_CRYPTO_H
++#define __NSS_CRYPTO_H
++
++#include <linux/seq_file.h>
++#include <linux/types.h>
++
++struct nss_core;
++struct nss_cmn_msg;
++
++#define NSS_CRYPTO_MAX_CTX		64
++#define NSS_CRYPTO_CIPHER_KEYLEN_MAX	32
++#define NSS_CRYPTO_AUTH_KEYLEN_MAX	128
++#define NSS_CRYPTO_NONCE_SIZE_MAX	4
++
++/* Wire values matching firmware enum nss_crypto_cmn_algo. */
++enum nss_crypto_algo {
++	NSS_CRYPTO_ALGO_AES128_GCM_GMAC		= 29,
++	NSS_CRYPTO_ALGO_AES128_CBC_MD5_HMAC	= 30,
++	NSS_CRYPTO_ALGO_AES128_CBC_SHA160_HMAC	= 31,
++	NSS_CRYPTO_ALGO_AES128_CBC_SHA256_HMAC	= 32,
++	NSS_CRYPTO_ALGO_AES128_CBC_SHA384_HMAC	= 33,
++	NSS_CRYPTO_ALGO_AES128_CBC_SHA512_HMAC	= 34,
++	NSS_CRYPTO_ALGO_AES192_GCM_GMAC		= 35,
++	NSS_CRYPTO_ALGO_AES192_CBC_SHA160_HMAC	= 37,
++	NSS_CRYPTO_ALGO_AES192_CBC_SHA256_HMAC	= 38,
++	NSS_CRYPTO_ALGO_AES192_CBC_SHA384_HMAC	= 39,
++	NSS_CRYPTO_ALGO_AES192_CBC_SHA512_HMAC	= 40,
++	NSS_CRYPTO_ALGO_AES256_GCM_GMAC		= 41,
++	NSS_CRYPTO_ALGO_AES256_CBC_MD5_HMAC	= 42,
++	NSS_CRYPTO_ALGO_AES256_CBC_SHA160_HMAC	= 43,
++	NSS_CRYPTO_ALGO_AES256_CBC_SHA256_HMAC	= 44,
++	NSS_CRYPTO_ALGO_AES256_CBC_SHA384_HMAC	= 45,
++	NSS_CRYPTO_ALGO_AES256_CBC_SHA512_HMAC	= 46,
++	NSS_CRYPTO_ALGO_3DES_CBC_SHA160_HMAC	= 66,
++	NSS_CRYPTO_ALGO_3DES_CBC_SHA256_HMAC	= 67,
++};
++
++struct nss_crypto_ctx_cfg {
++	enum nss_crypto_algo algo;
++	const u8 *cipher_key;
++	u16 cipher_keylen;
++	const u8 *auth_key;
++	u16 auth_keylen;
++	const u8 *nonce;
++	u16 nonce_len;
++};
++
++int nss_crypto_start(struct nss_core *core);
++void nss_crypto_stop(struct nss_core *core);
++bool nss_crypto_ready(void);
++int nss_crypto_ctx_alloc(const struct nss_crypto_ctx_cfg *cfg, u16 *idx_out);
++void nss_crypto_ctx_free(u16 idx);
++void nss_crypto_notify(struct nss_core *core, const struct nss_cmn_msg *ncm,
++		       u32 len);
++void nss_crypto_print(struct seq_file *s);
++
++#endif /* __NSS_CRYPTO_H */
+diff --git a/package/kernel/nss-wifi-drv/src/nss_ring.c b/package/kernel/nss-wifi-drv/src/nss_ring.c
+index af2970bf19..76705dc5a9 100644
+--- a/package/kernel/nss-wifi-drv/src/nss_ring.c
++++ b/package/kernel/nss-wifi-drv/src/nss_ring.c
+@@ -22,6 +22,7 @@
+ #include <linux/spinlock.h>
+ 
+ #include "nss_drv.h"
++#include "nss_crypto.h"
+ 
+ #define NSS_NAPI_WEIGHT		64
+ #define NSS_REFILL_BATCH	64
+@@ -178,6 +179,7 @@ static void nss_notify_recv(struct nss_core *core,
+ 	nss_msg_census(ncm);
+ 	nss_core_load_notify(core, ncm, desc->payload_len);
+ 	nss_c2c_notify(core, ncm, desc->payload_len);
++	nss_crypto_notify(core, ncm, desc->payload_len);
+ 
+ 	if (core->id != 0)
+ 		return;
+diff --git a/target/linux/qualcommax/dts/ipq8174-mx4300.dts b/target/linux/qualcommax/dts/ipq8174-mx4300.dts
+index 23db9e25ef..6022a4cc1f 100644
+--- a/target/linux/qualcommax/dts/ipq8174-mx4300.dts
++++ b/target/linux/qualcommax/dts/ipq8174-mx4300.dts
+@@ -325,6 +325,19 @@
+ 	status = "okay";
+ };
+ 
++&soc {
++	nss_eip197: crypto@39880000 {
++		compatible = "qcom,ipq8074-eip197";
++		reg = <0x39880000 0x80000>;
++		clocks = <&gcc GCC_NSS_CRYPTO_CLK>,
++			 <&gcc GCC_NSSNOC_CRYPTO_CLK>,
++			 <&gcc GCC_CRYPTO_PPE_CLK>;
++		clock-names = "crypto-clk", "nssnoc-crypto-clk",
++			      "crypto-ppe-clk";
++		status = "okay";
++	};
++};
++
+ /*
+  * CPU overclocking, off by default. The IPQ8174's own CPU PLL stops at
+  * 1401.6 MHz; faster speeds come from GCC's GPLL2 (see the clk-qcom
+-- 
+2.56.1
+

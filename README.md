@@ -73,6 +73,13 @@ published images from, and adds:
 - **On-demand NSS core load telemetry** (`patches/0004`): reading
   `/sys/kernel/debug/*.nss/load` samples NSS instruction counts for 200 ms and
   reports core utilization, keeping load reports off at idle.
+- **Opt-in NSS Core 1 + EIP-197 inline IPsec offload** (`patches/0005`–`0007`,
+  `feeds/mx4300/nss-eip-firmware`): off by default; boots Core 1 with C2C
+  pairing, EIP-197 hardware crypto, and inline XFRM IPsec offload. Test live
+  with `echo 1 > /sys/kernel/debug/39400000.nss/boot` or enable on boot with
+  `uci set nss-wifi.general.core1='1'; uci commit nss-wifi`. Inspect status via
+  `/sys/kernel/debug/39400000.nss/{c2c,crypto,ipsec}` (experimental, awaiting
+  hardware verification).
 
 ## How booting works
 
@@ -225,7 +232,7 @@ Every image is built from three layers:
 
 | Layer | File | Contents |
 |---|---|---|
-| Base | `configs/mx4300-nss.config` | OpenWrt with LuCI over HTTPS, PPE flow offload, NSS Wi-Fi offload (`kmod-nss-wifi-drv`, NSS firmware 12.5), SQM with the PPE shaper (`sqm-scripts`, `luci-app-sqm`, `luci-app-qca-ppe-qos`), `-mcpu=cortex-a53+crc`, OpenSSL (`apk-openssl`, `wpad-openssl`), `kmod-tun`, `kmod-wireguard`, IPsec/XFRM (`kmod-ipsec*`, `kmod-xfrm-interface`, AES-GCM), USB storage + `dm-crypt` (`kmod-dm`, `kmod-crypto-user`), `ppe-help`, crash logs (`kmod-ramoops`) |
+| Base | `configs/mx4300-nss.config` | OpenWrt with LuCI over HTTPS, PPE flow offload, NSS Wi-Fi offload (`kmod-nss-wifi-drv`, NSS firmware 12.5, `nss-eip-firmware`), SQM with the PPE shaper (`sqm-scripts`, `luci-app-sqm`, `luci-app-qca-ppe-qos`), `-mcpu=cortex-a53+crc`, OpenSSL (`apk-openssl`, `wpad-openssl`), `kmod-tun`, `kmod-wireguard`, IPsec/XFRM (`kmod-ipsec*`, `kmod-xfrm-interface`, AES-GCM), USB storage + `dm-crypt` (`kmod-dm`, `kmod-crypto-user`), `ppe-help`, crash logs (`kmod-ramoops`) |
 | Every profile | `configs/base.packages` | `mx4300-ota`, `luci-app-mx4300-ota` (the [firmware updater](#firmware-updates)), `luci-mod-dashboard` (LuCI's Dashboard status page, its landing page), `mx4300-cpu-oc`, `luci-app-mx4300-cpu-oc` ([CPU overclocking](docs/cpu-overclock.md), off by default), `luci-theme-footstrap` (the default LuCI theme: a new install, or a router still on Bootstrap, switches to it once, even when another theme in the image makes itself the default on install; a theme you chose stays) |
 | One profile | `profiles/<name>.packages` | what that profile adds or leaves out |
 
@@ -432,14 +439,15 @@ upstream/third-party.conf  third-party sources (feeds and single packages)
 patches/                   changes to the upstream tree (0001: boot counter hold;
                            0002: CPU overclocking kernel and device tree changes;
                            0003: kernel AES on the CPU's crypto instructions;
-                           0004: on-demand NSS core load telemetry)
+                           0004: on-demand NSS core load telemetry;
+                           0005–0007: opt-in NSS Core 1, EIP-197, inline IPsec)
 patches/feeds/FEED/        changes to a feed (sqm-scripts with the PPE shaper)
 configs/mx4300-nss.config  base build configuration (diffconfig)
 overlays/common/           files in every image (default theme switch)
 configs/base.packages      packages in every profile (the firmware updater)
 profiles/                  package profiles (*.packages)
 feeds/mx4300/              this repository's packages: mx4300-ota, luci-app-mx4300-ota,
-                           mx4300-cpu-oc, luci-app-mx4300-cpu-oc
+                           mx4300-cpu-oc, luci-app-mx4300-cpu-oc, nss-eip-firmware
 docs/                      longer documents (cpu-overclock.md, wifi-160mhz.md)
 scripts/build.sh           reproducible build of one or more profiles
 scripts/bump-upstream.sh   move upstream/ forward
