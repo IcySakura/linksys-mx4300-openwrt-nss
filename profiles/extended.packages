@@ -31,7 +31,24 @@ luci-app-cloudflared
 luci-app-ddns
 ddns-scripts-cloudflare
 
-# VPN: OpenConnect server and client
+# VPN: IKEv2/IPsec (strongSwan swanctl + XFRM, OpenSSL backend) and OpenConnect
+xfrm
+strongswan
+strongswan-charon
+strongswan-swanctl
+strongswan-mod-openssl
+strongswan-mod-kernel-netlink
+strongswan-mod-socket-default
+strongswan-mod-pem
+strongswan-mod-pkcs1
+strongswan-mod-pkcs8
+strongswan-mod-pkcs12
+strongswan-mod-x509
+strongswan-mod-pubkey
+strongswan-mod-constraints
+strongswan-mod-revocation
+strongswan-mod-random
+strongswan-mod-attr
 luci-app-ocserv
 luci-proto-openconnect
 openconnect
