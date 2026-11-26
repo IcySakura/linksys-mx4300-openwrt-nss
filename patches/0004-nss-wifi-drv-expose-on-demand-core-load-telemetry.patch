@@ -1,0 +1,248 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Myles Liu <lyx981mike@gmail.com>
+Date: Thu, 26 Nov 2026 12:00:32 -0800
+Subject: [PATCH] nss-wifi-drv: expose on-demand core load telemetry
+
+Read /sys/kernel/debug/<core>/load to temporarily enable the firmware's
+COREFREQ instruction-count reports for 200 ms, report min/avg/max core
+utilization, and turn the reports back off. Normal operation keeps load
+reports disabled for zero background overhead.
+---
+ package/kernel/nss-wifi-drv/src/nss_core.c | 129 ++++++++++++++++++++-
+ package/kernel/nss-wifi-drv/src/nss_drv.h  |  10 ++
+ package/kernel/nss-wifi-drv/src/nss_ring.c |   1 +
+ 3 files changed, 136 insertions(+), 4 deletions(-)
+
+diff --git a/package/kernel/nss-wifi-drv/src/nss_core.c b/package/kernel/nss-wifi-drv/src/nss_core.c
+index 3a26ba8668..cd3d175417 100644
+--- a/package/kernel/nss-wifi-drv/src/nss_core.c
++++ b/package/kernel/nss-wifi-drv/src/nss_core.c
+@@ -22,6 +22,7 @@
+ #include <linux/delay.h>
+ #include <linux/firmware.h>
+ #include <linux/io.h>
++#include <linux/math64.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+@@ -793,9 +794,11 @@ int nss_wifi_pool_set(struct nss_core *core, u32 payloads)
+  * a second until told not to, and this driver scales nothing. It is told
+  * the rate the core already runs at, so the clock is not moved by this.
+  */
+-#define NSS_INTERFACE_COREFREQ		175
+ #define NSS_COREFREQ_CHANGE		1
++#define NSS_COREFREQ_STATS		3
+ #define NSS_CLK_CORE			14
++#define NSS_LOAD_SAMPLE_MS		200
++#define NSS_LOAD_EFF_CAPACITY_PCT	75
+ 
+ struct nss_corefreq_msg {
+ 	struct nss_cmn_msg cm;
+@@ -806,7 +809,12 @@ struct nss_corefreq_msg {
+ 	s32 ack;
+ };
+ 
+-static void nss_core_stats_off(struct nss_core *core)
++struct nss_core_stats_msg {
++	struct nss_cmn_msg cm;
++	u32 inst_cnt_total;
++};
++
++static int nss_core_stats_set(struct nss_core *core, bool enable, s32 *ack_out)
+ {
+ 	struct nss_corefreq_msg m = {};
+ 	int ret;
+@@ -818,10 +826,49 @@ static void nss_core_stats_off(struct nss_core *core)
+ 	m.cm.type = NSS_COREFREQ_CHANGE;
+ 	m.frequency = clk_get_rate(core->clks[NSS_CLK_CORE].clk);
+ 	m.start_or_end = 1;
++	m.stats_enable = enable ? 1 : 0;
+ 	ret = nss_msg_send(core, &m, sizeof(m));
++	if (ack_out)
++		*ack_out = m.ack;
++
++	return ret;
++}
++
++static void nss_core_stats_off(struct nss_core *core)
++{
++	s32 ack = 0;
++	int ret;
++
++	ret = nss_core_stats_set(core, false, &ack);
++	dev_info(core->dev, "load reports off at %lu Hz: %d ack %d\n",
++		 clk_get_rate(core->clks[NSS_CLK_CORE].clk), ret, ack);
++}
++
++void nss_core_load_notify(struct nss_core *core, const struct nss_cmn_msg *ncm,
++			  u32 len)
++{
++	const struct nss_core_stats_msg *sm =
++		(const struct nss_core_stats_msg *)ncm;
++	u32 inst;
++
++	if (ncm->interface != NSS_INTERFACE_COREFREQ ||
++	    ncm->type != NSS_COREFREQ_STATS || len < sizeof(*sm))
++		return;
++
++	if (!READ_ONCE(core->load_sampling))
++		return;
++
++	inst = sm->inst_cnt_total;
+ 
+-	dev_info(core->dev, "load reports off at %u Hz: %d ack %d\n",
+-		 m.frequency, ret, m.ack);
++	guard(spinlock_bh)(&core->load_lock);
++	if (!core->load_sampling)
++		return;
++	core->load_inst_sum += inst;
++	if (inst < core->load_inst_min)
++		core->load_inst_min = inst;
++	if (inst > core->load_inst_max)
++		core->load_inst_max = inst;
++	core->load_samples++;
+ }
+ 
+ static int nss_core_boot(struct nss_core *core)
+@@ -1248,6 +1295,77 @@ static int nss_mesh_show(struct seq_file *s, void *unused)
+ }
+ DEFINE_SHOW_ATTRIBUTE(nss_mesh);
+ 
++static u32 nss_inst_to_pct(u64 inst, u64 cap)
++{
++	if (!cap)
++		return 0;
++	return min_t(u64, 100, div64_u64(inst * 100 + cap / 2, cap));
++}
++
++/* Sample NSS core utilization on demand so normal operation incurs zero
++ * 1 kHz notification overhead.
++ */
++static int nss_load_show(struct seq_file *s, void *unused)
++{
++	struct nss_core *core = s->private;
++	unsigned long freq;
++	u64 sum, avg_inst, max_inst, eff_cap;
++	u32 min_inst, max_seen, samples;
++	int ret;
++
++	guard(mutex)(&core->lock);
++	if (!core->running)
++		return -ENODEV;
++
++	freq = clk_get_rate(core->clks[NSS_CLK_CORE].clk);
++
++	scoped_guard(spinlock_bh, &core->load_lock) {
++		core->load_inst_sum = 0;
++		core->load_inst_min = U32_MAX;
++		core->load_inst_max = 0;
++		core->load_samples = 0;
++		WRITE_ONCE(core->load_sampling, true);
++	}
++
++	ret = nss_core_stats_set(core, true, NULL);
++	if (ret) {
++		WRITE_ONCE(core->load_sampling, false);
++		return ret;
++	}
++
++	msleep_interruptible(NSS_LOAD_SAMPLE_MS);
++
++	if (core->running)
++		nss_core_stats_set(core, false, NULL);
++
++	scoped_guard(spinlock_bh, &core->load_lock) {
++		WRITE_ONCE(core->load_sampling, false);
++		sum = core->load_inst_sum;
++		min_inst = core->load_inst_min;
++		max_seen = core->load_inst_max;
++		samples = core->load_samples;
++	}
++
++	max_inst = freq / 1000;
++	eff_cap = div64_u64(max_inst * NSS_LOAD_EFF_CAPACITY_PCT, 100);
++	avg_inst = samples ? div64_u64(sum, samples) : 0;
++	if (!samples)
++		min_inst = 0;
++
++	seq_printf(s, "freq_hz: %lu\n", freq);
++	seq_printf(s, "samples: %u\n", samples);
++	seq_printf(s, "load_pct: avg %u min %u max %u (raw_avg %u%%)\n",
++		   nss_inst_to_pct(avg_inst, eff_cap),
++		   nss_inst_to_pct(min_inst, eff_cap),
++		   nss_inst_to_pct(max_seen, eff_cap),
++		   nss_inst_to_pct(avg_inst, max_inst));
++	seq_printf(s, "inst_per_ms: avg %llu min %u max %u / %llu\n",
++		   avg_inst, min_inst, max_seen, max_inst);
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(nss_load);
++
+ static void nss_aux_clocks_put(void *data)
+ {
+ 	struct nss_core *core = data;
+@@ -1352,6 +1470,7 @@ static int nss_probe(struct platform_device *pdev)
+ 	INIT_WORK(&core->restart, nss_core_restart);
+ 	INIT_WORK(&core->arm, nss_phys_work);
+ 	INIT_WORK(&core->edma_reset, nss_edma_reset_work);
++	spin_lock_init(&core->load_lock);
+ 
+ 	ret = devm_mutex_init(dev, &core->lock);
+ 	if (ret)
+@@ -1466,6 +1585,8 @@ static int nss_probe(struct platform_device *pdev)
+ 			    &nss_mesh_fops);
+ 	debugfs_create_file("redir", 0400, core->debugfs, core,
+ 			    &nss_redir_fops);
++	debugfs_create_file("load", 0400, core->debugfs, core,
++			    &nss_load_fops);
+ 
+ 	return 0;
+ }
+diff --git a/package/kernel/nss-wifi-drv/src/nss_drv.h b/package/kernel/nss-wifi-drv/src/nss_drv.h
+index 1d34cb20aa..0dbaca5bb4 100644
+--- a/package/kernel/nss-wifi-drv/src/nss_drv.h
++++ b/package/kernel/nss-wifi-drv/src/nss_drv.h
+@@ -85,6 +85,7 @@ unsigned int nss_pool_ceiling(void);
+ #define NSS_INTERFACE_ETH_RX	158
+ #define NSS_INTERFACE_IPV4	161
+ #define NSS_INTERFACE_IPV6	163
++#define NSS_INTERFACE_COREFREQ	175
+ #define NSS_INTERFACE_DYNAMIC	176
+ /* The base virtual-device node, where the firmware keeps settings that
+  * belong to every virtual device rather than to one of them.
+@@ -455,6 +456,13 @@ struct nss_core {
+ 	spinlock_t lent_lock;
+ 	struct completion booted;
+ 
++	spinlock_t load_lock;
++	bool load_sampling;
++	u64 load_inst_sum;
++	u32 load_inst_min;
++	u32 load_inst_max;
++	u32 load_samples;
++
+ 	struct clk_bulk_data clks[];
+ };
+ 
+@@ -468,6 +476,8 @@ void nss_pbuf_pool_free(struct nss_core *core);
+ void nss_core_stop(struct nss_core *core);
+ void nss_core_fault(struct nss_core *core);
+ void nss_core_resume(struct nss_core *core);
++void nss_core_load_notify(struct nss_core *core, const struct nss_cmn_msg *ncm,
++			  u32 len);
+ int nss_rings_start(struct nss_core *core);
+ void nss_iface_bind(struct nss_core *core);
+ void nss_iface_unbind(struct nss_core *core);
+diff --git a/package/kernel/nss-wifi-drv/src/nss_ring.c b/package/kernel/nss-wifi-drv/src/nss_ring.c
+index 4e3d941982..ada234ef6b 100644
+--- a/package/kernel/nss-wifi-drv/src/nss_ring.c
++++ b/package/kernel/nss-wifi-drv/src/nss_ring.c
+@@ -176,6 +176,7 @@ static void nss_notify_recv(struct nss_core *core,
+ 	ncm = (const void *)(skb->head + desc->payload_offs);
+ 	nss_msg_seen(core, ncm, desc->payload_len);
+ 	nss_msg_census(ncm);
++	nss_core_load_notify(core, ncm, desc->payload_len);
+ 	nss_flow_notify(ncm, desc->payload_len);
+ 
+ 	if (nss_wifili_is_soc(ncm->interface))

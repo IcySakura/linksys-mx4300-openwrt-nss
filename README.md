@@ -1,5 +1,8 @@
 # OpenWrt with PPE + NSS offload for the Linksys MX4300
 
+> [!CAUTION]
+> This repository is **AI-assisted** and has undergone only **limited human review**. Inspect changes and test carefully before flashing.
+
 OpenWrt for the **Linksys MX4300** (IPQ8174) with the SoC's offload engines in
 use: routed, NAT, PPPoE and bridged wired traffic is forwarded by the **PPE**
 (the packet engine in the switch) through OpenWrt's own flowtable, and the
@@ -31,9 +34,9 @@ published images from, and adds:
 
 | | |
 |---|---|
-| Boot, settings kept from stock OpenWrt | ⚠️ not tested yet |
-| PPE wired offload, NSS Wi-Fi offload | ⚠️ upstream feature; not tested with this build yet |
-| Firmware updates with trial boot and rollback | ⚠️ not tested yet |
+| Boot, settings kept from stock OpenWrt | ✅ tested on hardware |
+| PPE wired offload, NSS Wi-Fi offload, PPE hardware SQM | ✅ tested on hardware |
+| Firmware updates with trial boot and rollback | ✅ tested on hardware |
 
 ## What this build adds
 
@@ -43,8 +46,8 @@ published images from, and adds:
 - **Build configuration** (`configs/mx4300-nss.config`): the upstream builder's
   offload setup (PPE flowtable offload, `nss-wifi-drv` with NSS firmware 12.5,
   SQM through the PPE shaper with `luci-app-sqm` and `luci-app-qca-ppe-qos`),
-  OpenSSL throughout, and the kernel modules most often wanted (USB storage,
-  TUN, WireGuard) built in.
+  `-mcpu=cortex-a53+crc` userspace optimization, OpenSSL throughout, and common
+  kernel modules (USB storage, `dm-crypt`, TUN, WireGuard) built in.
 - **Third-party software** (`upstream/third-party.conf`): sources outside
   OpenWrt, pinned to a commit like the feeds and following their releases
   where they publish any. The `extended` profile uses Passwall from there.
@@ -63,9 +66,12 @@ published images from, and adds:
 - **Kernel AES on the CPU's crypto instructions** (`patches/0003`): the
   kernel's AES-CBC/CTR/XTS, AES-GCM and AES-CCM use the ARMv8 Crypto
   Extensions instead of generic C (AES-CBC 9.1 instead of 0.45 Gbit/s per
-  core). Helps kernel crypto users such as IPsec and WPA3 management frame
-  protection; programs with their own crypto (Xray, OpenSSL) already use
-  the instructions.
+  core). Helps kernel crypto users such as IPsec, `dm-crypt` and WPA3
+  management frame protection; programs with their own crypto (Xray, OpenSSL)
+  already use the instructions.
+- **On-demand NSS core load telemetry** (`patches/0004`): reading
+  `/sys/kernel/debug/*.nss/load` samples NSS instruction counts for 200 ms and
+  reports core utilization, keeping load reports off at idle.
 
 ## How booting works
 
@@ -218,7 +224,7 @@ Every image is built from three layers:
 
 | Layer | File | Contents |
 |---|---|---|
-| Base | `configs/mx4300-nss.config` | OpenWrt with LuCI over HTTPS, PPE flow offload, NSS Wi-Fi offload (`kmod-nss-wifi-drv`, NSS firmware 12.5), SQM with the PPE shaper (`sqm-scripts`, `luci-app-sqm`, `luci-app-qca-ppe-qos`), OpenSSL (`apk-openssl`, `wpad-openssl`), `kmod-tun`, `kmod-wireguard`, USB storage, `ppe-help`, crash logs (`kmod-ramoops`) |
+| Base | `configs/mx4300-nss.config` | OpenWrt with LuCI over HTTPS, PPE flow offload, NSS Wi-Fi offload (`kmod-nss-wifi-drv`, NSS firmware 12.5), SQM with the PPE shaper (`sqm-scripts`, `luci-app-sqm`, `luci-app-qca-ppe-qos`), `-mcpu=cortex-a53+crc`, OpenSSL (`apk-openssl`, `wpad-openssl`), `kmod-tun`, `kmod-wireguard`, USB storage + `dm-crypt` (`kmod-dm`, `kmod-crypto-user`), `ppe-help`, crash logs (`kmod-ramoops`) |
 | Every profile | `configs/base.packages` | `mx4300-ota`, `luci-app-mx4300-ota` (the [firmware updater](#firmware-updates)), `luci-mod-dashboard` (LuCI's Dashboard status page, its landing page), `mx4300-cpu-oc`, `luci-app-mx4300-cpu-oc` ([CPU overclocking](docs/cpu-overclock.md), off by default), `luci-theme-footstrap` (the default LuCI theme: a new install, or a router still on Bootstrap, switches to it once, even when another theme in the image makes itself the default on install; a theme you chose stays) |
 | One profile | `profiles/<name>.packages` | what that profile adds or leaves out |
 
@@ -424,7 +430,8 @@ upstream/feeds.conf        pinned feeds and the branches they follow
 upstream/third-party.conf  third-party sources (feeds and single packages)
 patches/                   changes to the upstream tree (0001: boot counter hold;
                            0002: CPU overclocking kernel and device tree changes;
-                           0003: kernel AES on the CPU's crypto instructions)
+                           0003: kernel AES on the CPU's crypto instructions;
+                           0004: on-demand NSS core load telemetry)
 patches/feeds/FEED/        changes to a feed (sqm-scripts with the PPE shaper)
 configs/mx4300-nss.config  base build configuration (diffconfig)
 overlays/common/           files in every image (default theme switch)
