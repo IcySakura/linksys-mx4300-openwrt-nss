@@ -90,6 +90,8 @@ while read -r kind name url; do
 	[ -n "$repo" ] && [ -n "$branch" ] || { echo "feed $name: no GitHub branch to follow, left alone" >&2; continue; }
 	if [ "$name" = nss ] && [ -n "$nss" ]; then
 		new=$nss
+	elif grep -q "^# follows $name $branch (head)" "$FEEDS"; then
+		new=$(branch_commit "$repo" "$branch")
 	else
 		new=$(branch_commit "$repo" "$branch" "$built")
 	fi

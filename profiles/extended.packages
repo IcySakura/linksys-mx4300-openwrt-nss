@@ -33,9 +33,11 @@ ddns-scripts-cloudflare
 
 # VPN: IKEv2/IPsec (strongSwan swanctl + XFRM, OpenSSL backend) and OpenConnect
 xfrm
+luci-proto-xfrm
 strongswan
 strongswan-charon
 strongswan-swanctl
+luci-app-strongswan-swanctl
 strongswan-mod-openssl
 strongswan-mod-kernel-netlink
 strongswan-mod-socket-default
