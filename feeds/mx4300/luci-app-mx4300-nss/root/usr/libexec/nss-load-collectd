@@ -1,0 +1,40 @@
+#!/bin/sh
+# Collectd exec plugin script for NSS Core 0 and Core 1 utilization.
+# Runs unprivileged (nobody), reading the world-readable sysfs load attributes.
+
+HOST="${COLLECTD_HOSTNAME:-$(cat /proc/sys/kernel/hostname 2>/dev/null || echo localhost)}"
+INTERVAL="${COLLECTD_INTERVAL:-30}"
+INTERVAL="${INTERVAL%%.*}"
+[ -n "$INTERVAL" ] && [ "$INTERVAL" -ge 5 ] 2>/dev/null || INTERVAL=30
+
+emit_core() {
+	local path="$1"
+	local inst="$2"
+	local out avg peak
+
+	[ -r "$path" ] || return 0
+	out=$(cat "$path" 2>/dev/null) || return 0
+
+	case "$out" in
+	*"running: 0"*)
+		avg=0
+		peak=0
+		;;
+	*)
+		avg=$(printf '%s\n' "$out" | awk '/^load_pct:/ { print $3 }')
+		peak=$(printf '%s\n' "$out" | awk '/^load_pct:/ { print $7 }')
+		[ -n "$avg" ] && [ -n "$peak" ] || return 0
+		;;
+	esac
+
+	printf 'PUTVAL "%s/nss_load-%s/percent-active" interval=%s N:%s\n' \
+		"$HOST" "$inst" "$INTERVAL" "$avg"
+	printf 'PUTVAL "%s/nss_load-%s/percent-peak" interval=%s N:%s\n' \
+		"$HOST" "$inst" "$INTERVAL" "$peak"
+}
+
+while true; do
+	emit_core /sys/bus/platform/drivers/nss-wifi-drv/39000000.nss/load core0
+	emit_core /sys/bus/platform/drivers/nss-wifi-drv/39400000.nss/load core1
+	sleep "$INTERVAL"
+done

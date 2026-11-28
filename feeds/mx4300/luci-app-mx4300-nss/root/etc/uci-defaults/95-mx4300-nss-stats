@@ -1,0 +1,17 @@
+#!/bin/sh
+# Enable collectd exec polling for NSS core utilization when luci-app-statistics
+# and collectd-mod-exec are installed. Idempotent across sysupgrades.
+
+[ -f /etc/config/luci_statistics ] || exit 0
+[ -f /usr/lib/collectd/exec.so ] || exit 0
+
+uci -q batch <<'EOF'
+set luci_statistics.collectd_exec=statistics
+set luci_statistics.collectd_exec.enable='1'
+set luci_statistics.collectd_exec_nss=collectd_exec_input
+set luci_statistics.collectd_exec_nss.cmduser='nobody'
+set luci_statistics.collectd_exec_nss.cmdline='/usr/libexec/nss-load-collectd'
+commit luci_statistics
+EOF
+
+exit 0

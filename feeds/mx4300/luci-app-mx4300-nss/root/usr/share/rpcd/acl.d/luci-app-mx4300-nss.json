@@ -1,0 +1,13 @@
+{
+	"luci-app-mx4300-nss": {
+		"description": "Grant read access to NSS core load telemetry",
+		"read": {
+			"file": {
+				"/sys/bus/platform/drivers/nss-wifi-drv/39000000.nss/load": [ "read" ],
+				"/sys/bus/platform/drivers/nss-wifi-drv/39400000.nss/load": [ "read" ],
+				"/sys/devices/platform/*/39000000.nss/load": [ "read" ],
+				"/sys/devices/platform/*/39400000.nss/load": [ "read" ]
+			}
+		}
+	}
+}

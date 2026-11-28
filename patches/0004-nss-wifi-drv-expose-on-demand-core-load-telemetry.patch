@@ -1,20 +1,20 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Myles Liu <lyx981mike@gmail.com>
 Date: Thu, 26 Nov 2026 12:00:32 -0800
-Subject: [PATCH] nss-wifi-drv: expose on-demand core load telemetry
+Subject: [PATCH 1/4] nss-wifi-drv: expose on-demand core load telemetry
 
 Read /sys/kernel/debug/<core>/load to temporarily enable the firmware's
 COREFREQ instruction-count reports for 200 ms, report min/avg/max core
 utilization, and turn the reports back off. Normal operation keeps load
 reports disabled for zero background overhead.
 ---
- package/kernel/nss-wifi-drv/src/nss_core.c | 129 ++++++++++++++++++++-
- package/kernel/nss-wifi-drv/src/nss_drv.h  |  10 ++
+ package/kernel/nss-wifi-drv/src/nss_core.c | 226 ++++++++++++++++++++-
+ package/kernel/nss-wifi-drv/src/nss_drv.h  |  22 ++
  package/kernel/nss-wifi-drv/src/nss_ring.c |   1 +
- 3 files changed, 136 insertions(+), 4 deletions(-)
+ 3 files changed, 245 insertions(+), 4 deletions(-)
 
 diff --git a/package/kernel/nss-wifi-drv/src/nss_core.c b/package/kernel/nss-wifi-drv/src/nss_core.c
-index 3a26ba8668..cd3d175417 100644
+index 3a26ba8668..b59f15c5fe 100644
 --- a/package/kernel/nss-wifi-drv/src/nss_core.c
 +++ b/package/kernel/nss-wifi-drv/src/nss_core.c
 @@ -22,6 +22,7 @@
@@ -25,7 +25,16 @@ index 3a26ba8668..cd3d175417 100644
  #include <linux/module.h>
  #include <linux/of.h>
  #include <linux/of_address.h>
-@@ -793,9 +794,11 @@ int nss_wifi_pool_set(struct nss_core *core, u32 payloads)
+@@ -453,6 +454,8 @@ static void nss_core_halt(struct nss_core *core)
+ 	if (!core->loaded)
+ 		return;
+ 
++	core->load_cache_valid = false;
++
+ 	qca_ppe_fw_carrier_set(core->conduit, NULL);
+ 	writel(1, core->nphys + NSS_CORE_RESET_CTRL);
+ 
+@@ -793,9 +796,11 @@ int nss_wifi_pool_set(struct nss_core *core, u32 payloads)
   * a second until told not to, and this driver scales nothing. It is told
   * the rate the core already runs at, so the clock is not moved by this.
   */
@@ -38,7 +47,7 @@ index 3a26ba8668..cd3d175417 100644
  
  struct nss_corefreq_msg {
  	struct nss_cmn_msg cm;
-@@ -806,7 +809,12 @@ struct nss_corefreq_msg {
+@@ -806,7 +811,12 @@ struct nss_corefreq_msg {
  	s32 ack;
  };
  
@@ -52,7 +61,7 @@ index 3a26ba8668..cd3d175417 100644
  {
  	struct nss_corefreq_msg m = {};
  	int ret;
-@@ -818,10 +826,49 @@ static void nss_core_stats_off(struct nss_core *core)
+@@ -818,10 +828,56 @@ static void nss_core_stats_off(struct nss_core *core)
  	m.cm.type = NSS_COREFREQ_CHANGE;
  	m.frequency = clk_get_rate(core->clks[NSS_CLK_CORE].clk);
  	m.start_or_end = 1;
@@ -95,6 +104,13 @@ index 3a26ba8668..cd3d175417 100644
 +	guard(spinlock_bh)(&core->load_lock);
 +	if (!core->load_sampling)
 +		return;
++	/* The first notification after re-enabling COREFREQ stats carries the
++	 * accumulated instruction count since stats were last disabled.
++	 */
++	if (core->load_skip_first) {
++		core->load_skip_first = false;
++		return;
++	}
 +	core->load_inst_sum += inst;
 +	if (inst < core->load_inst_min)
 +		core->load_inst_min = inst;
@@ -104,7 +120,7 @@ index 3a26ba8668..cd3d175417 100644
  }
  
  static int nss_core_boot(struct nss_core *core)
-@@ -1248,6 +1295,77 @@ static int nss_mesh_show(struct seq_file *s, void *unused)
+@@ -1248,6 +1304,161 @@ static int nss_mesh_show(struct seq_file *s, void *unused)
  }
  DEFINE_SHOW_ATTRIBUTE(nss_mesh);
  
@@ -115,28 +131,40 @@ index 3a26ba8668..cd3d175417 100644
 +	return min_t(u64, 100, div64_u64(inst * 100 + cap / 2, cap));
 +}
 +
-+/* Sample NSS core utilization on demand so normal operation incurs zero
-+ * 1 kHz notification overhead.
++#define NSS_LOAD_CACHE_MS		500
++
++/* Sample NSS core utilization on demand with a short cache so normal operation
++ * incurs zero 1 kHz notification overhead and concurrent readers share one
++ * sample.
 + */
-+static int nss_load_show(struct seq_file *s, void *unused)
++static int nss_load_sample(struct nss_core *core,
++			   struct nss_load_snapshot *out, bool *running)
 +{
-+	struct nss_core *core = s->private;
-+	unsigned long freq;
-+	u64 sum, avg_inst, max_inst, eff_cap;
++	u64 sum;
 +	u32 min_inst, max_seen, samples;
 +	int ret;
 +
 +	guard(mutex)(&core->lock);
-+	if (!core->running)
-+		return -ENODEV;
++	if (!core->running) {
++		*running = false;
++		return 0;
++	}
++	*running = true;
 +
-+	freq = clk_get_rate(core->clks[NSS_CLK_CORE].clk);
++	if (core->load_cache_valid &&
++	    time_before(jiffies,
++			core->load_cache_jiffies +
++			msecs_to_jiffies(NSS_LOAD_CACHE_MS))) {
++		*out = core->load_cache;
++		return 0;
++	}
 +
 +	scoped_guard(spinlock_bh, &core->load_lock) {
 +		core->load_inst_sum = 0;
 +		core->load_inst_min = U32_MAX;
 +		core->load_inst_max = 0;
 +		core->load_samples = 0;
++		core->load_skip_first = true;
 +		WRITE_ONCE(core->load_sampling, true);
 +	}
 +
@@ -159,30 +187,102 @@ index 3a26ba8668..cd3d175417 100644
 +		samples = core->load_samples;
 +	}
 +
-+	max_inst = freq / 1000;
-+	eff_cap = div64_u64(max_inst * NSS_LOAD_EFF_CAPACITY_PCT, 100);
-+	avg_inst = samples ? div64_u64(sum, samples) : 0;
-+	if (!samples)
-+		min_inst = 0;
++	out->freq = clk_get_rate(core->clks[NSS_CLK_CORE].clk);
++	out->samples = samples;
++	out->avg_inst = samples ? div64_u64(sum, samples) : 0;
++	out->min_inst = samples ? min_inst : 0;
++	out->max_inst = samples ? max_seen : 0;
 +
-+	seq_printf(s, "freq_hz: %lu\n", freq);
-+	seq_printf(s, "samples: %u\n", samples);
++	core->load_cache = *out;
++	core->load_cache_jiffies = jiffies;
++	core->load_cache_valid = true;
++
++	return 0;
++}
++
++static int nss_load_show(struct seq_file *s, void *unused)
++{
++	struct nss_core *core = s->private;
++	struct nss_load_snapshot snap = {};
++	bool running = false;
++	u64 max_inst, eff_cap;
++	int ret;
++
++	ret = nss_load_sample(core, &snap, &running);
++	if (ret)
++		return ret;
++
++	if (!running) {
++		seq_puts(s, "running: 0\n");
++		return 0;
++	}
++
++	max_inst = snap.freq / 1000;
++	eff_cap = div64_u64(max_inst * NSS_LOAD_EFF_CAPACITY_PCT, 100);
++
++	seq_puts(s, "running: 1\n");
++	seq_printf(s, "freq_hz: %lu\n", snap.freq);
++	seq_printf(s, "samples: %u\n", snap.samples);
 +	seq_printf(s, "load_pct: avg %u min %u max %u (raw_avg %u%%)\n",
-+		   nss_inst_to_pct(avg_inst, eff_cap),
-+		   nss_inst_to_pct(min_inst, eff_cap),
-+		   nss_inst_to_pct(max_seen, eff_cap),
-+		   nss_inst_to_pct(avg_inst, max_inst));
++		   nss_inst_to_pct(snap.avg_inst, eff_cap),
++		   nss_inst_to_pct(snap.min_inst, eff_cap),
++		   nss_inst_to_pct(snap.max_inst, eff_cap),
++		   nss_inst_to_pct(snap.avg_inst, max_inst));
 +	seq_printf(s, "inst_per_ms: avg %llu min %u max %u / %llu\n",
-+		   avg_inst, min_inst, max_seen, max_inst);
++		   snap.avg_inst, snap.min_inst, snap.max_inst, max_inst);
 +
 +	return 0;
 +}
 +DEFINE_SHOW_ATTRIBUTE(nss_load);
 +
++static ssize_t load_show(struct device *dev, struct device_attribute *attr,
++			 char *buf)
++{
++	struct nss_core *core = dev_get_drvdata(dev);
++	struct nss_load_snapshot snap = {};
++	bool running = false;
++	u64 max_inst, eff_cap;
++	int ret;
++
++	ret = nss_load_sample(core, &snap, &running);
++	if (ret)
++		return ret;
++
++	if (!running)
++		return sysfs_emit(buf, "running: 0\n");
++
++	max_inst = snap.freq / 1000;
++	eff_cap = div64_u64(max_inst * NSS_LOAD_EFF_CAPACITY_PCT, 100);
++
++	return sysfs_emit(buf,
++			  "running: 1\n"
++			  "freq_hz: %lu\n"
++			  "samples: %u\n"
++			  "load_pct: avg %u min %u max %u (raw_avg %u%%)\n"
++			  "inst_per_ms: avg %llu min %u max %u / %llu\n",
++			  snap.freq, snap.samples,
++			  nss_inst_to_pct(snap.avg_inst, eff_cap),
++			  nss_inst_to_pct(snap.min_inst, eff_cap),
++			  nss_inst_to_pct(snap.max_inst, eff_cap),
++			  nss_inst_to_pct(snap.avg_inst, max_inst),
++			  snap.avg_inst, snap.min_inst, snap.max_inst,
++			  max_inst);
++}
++static DEVICE_ATTR_RO(load);
++
++static struct attribute *nss_sysfs_attrs[] = {
++	&dev_attr_load.attr,
++	NULL,
++};
++
++static const struct attribute_group nss_sysfs_group = {
++	.attrs = nss_sysfs_attrs,
++};
++
  static void nss_aux_clocks_put(void *data)
  {
  	struct nss_core *core = data;
-@@ -1352,6 +1470,7 @@ static int nss_probe(struct platform_device *pdev)
+@@ -1352,6 +1563,7 @@ static int nss_probe(struct platform_device *pdev)
  	INIT_WORK(&core->restart, nss_core_restart);
  	INIT_WORK(&core->arm, nss_phys_work);
  	INIT_WORK(&core->edma_reset, nss_edma_reset_work);
@@ -190,7 +290,18 @@ index 3a26ba8668..cd3d175417 100644
  
  	ret = devm_mutex_init(dev, &core->lock);
  	if (ret)
-@@ -1466,6 +1585,8 @@ static int nss_probe(struct platform_device *pdev)
+@@ -1435,6 +1647,10 @@ static int nss_probe(struct platform_device *pdev)
+ 	core->edma_stale = true;
+ 
+ 	platform_set_drvdata(pdev, core);
++
++	ret = devm_device_add_group(dev, &nss_sysfs_group);
++	if (ret)
++		dev_warn(dev, "sysfs load attribute failed: %d\n", ret);
+ 	nss_wifili_bind(core);
+ 	nss_flow_bind(core);
+ 	nss_mc_bind(core);
+@@ -1466,6 +1682,8 @@ static int nss_probe(struct platform_device *pdev)
  			    &nss_mesh_fops);
  	debugfs_create_file("redir", 0400, core->debugfs, core,
  			    &nss_redir_fops);
@@ -200,7 +311,7 @@ index 3a26ba8668..cd3d175417 100644
  	return 0;
  }
 diff --git a/package/kernel/nss-wifi-drv/src/nss_drv.h b/package/kernel/nss-wifi-drv/src/nss_drv.h
-index 1d34cb20aa..0dbaca5bb4 100644
+index 1d34cb20aa..869c685000 100644
 --- a/package/kernel/nss-wifi-drv/src/nss_drv.h
 +++ b/package/kernel/nss-wifi-drv/src/nss_drv.h
 @@ -85,6 +85,7 @@ unsigned int nss_pool_ceiling(void);
@@ -211,12 +322,31 @@ index 1d34cb20aa..0dbaca5bb4 100644
  #define NSS_INTERFACE_DYNAMIC	176
  /* The base virtual-device node, where the firmware keeps settings that
   * belong to every virtual device rather than to one of them.
-@@ -455,6 +456,13 @@ struct nss_core {
+@@ -360,6 +361,14 @@ struct nss_fw_line {
+ 	bool mesh;
+ };
+ 
++struct nss_load_snapshot {
++	unsigned long freq;
++	u64 avg_inst;
++	u32 min_inst;
++	u32 max_inst;
++	u32 samples;
++};
++
+ struct nss_core {
+ 	struct device *dev;
+ 	const struct nss_soc *soc;
+@@ -455,6 +464,17 @@ struct nss_core {
  	spinlock_t lent_lock;
  	struct completion booted;
  
 +	spinlock_t load_lock;
 +	bool load_sampling;
++	bool load_skip_first;
++	bool load_cache_valid;
++	unsigned long load_cache_jiffies;
++	struct nss_load_snapshot load_cache;
 +	u64 load_inst_sum;
 +	u32 load_inst_min;
 +	u32 load_inst_max;
@@ -225,7 +355,7 @@ index 1d34cb20aa..0dbaca5bb4 100644
  	struct clk_bulk_data clks[];
  };
  
-@@ -468,6 +476,8 @@ void nss_pbuf_pool_free(struct nss_core *core);
+@@ -468,6 +488,8 @@ void nss_pbuf_pool_free(struct nss_core *core);
  void nss_core_stop(struct nss_core *core);
  void nss_core_fault(struct nss_core *core);
  void nss_core_resume(struct nss_core *core);

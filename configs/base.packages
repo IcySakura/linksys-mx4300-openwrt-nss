@@ -23,3 +23,7 @@ luci-mod-dashboard
 # without it: "-luci-app-mx4300-cpu-oc" and "-mx4300-cpu-oc" in your profile.
 mx4300-cpu-oc
 luci-app-mx4300-cpu-oc
+
+# NSS core load monitoring: LuCI Dashboard / Overview live widgets and
+# luci-app-statistics RRD graph definition.
+luci-app-mx4300-nss

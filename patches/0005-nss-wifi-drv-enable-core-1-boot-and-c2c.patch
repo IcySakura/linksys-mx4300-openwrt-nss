@@ -1,20 +1,20 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Myles Liu <lyx981mike@gmail.com>
 Date: Thu, 26 Nov 2026 13:18:42 -0800
-Subject: [PATCH] nss-wifi-drv: enable NSS Core 1 boot and C2C pairing
+Subject: [PATCH 2/4] nss-wifi-drv: enable NSS Core 1 boot and C2C pairing
 
 Enable the &nss1 DT node on Linksys MX4300 and extend nss-wifi-drv to support booting Core 1 independently of Core 0 (without touching EDMA, PPE, or Wi-Fi), with per-core buffer pool sizing, locked shared misc_reset updates, and automatic bidirectional C2C queue pairing plus /sys/kernel/debug/<core>/c2c diagnostics.
 ---
- package/kernel/nss-wifi-drv/src/nss_core.c    | 475 +++++++++++++-----
+ package/kernel/nss-wifi-drv/src/nss_core.c    | 474 +++++++++++++-----
  package/kernel/nss-wifi-drv/src/nss_drv.h     |  22 +-
  package/kernel/nss-wifi-drv/src/nss_meminfo.c |   5 +
  package/kernel/nss-wifi-drv/src/nss_msg.c     |   3 +
  package/kernel/nss-wifi-drv/src/nss_ring.c    |   7 +-
  .../linux/qualcommax/dts/ipq8174-mx4300.dts   |   9 +
- 6 files changed, 402 insertions(+), 119 deletions(-)
+ 6 files changed, 401 insertions(+), 119 deletions(-)
 
 diff --git a/package/kernel/nss-wifi-drv/src/nss_core.c b/package/kernel/nss-wifi-drv/src/nss_core.c
-index cd3d175417..bc1ef8a295 100644
+index b59f15c5fe..582dcea986 100644
 --- a/package/kernel/nss-wifi-drv/src/nss_core.c
 +++ b/package/kernel/nss-wifi-drv/src/nss_core.c
 @@ -42,10 +42,26 @@
@@ -93,7 +93,7 @@ index cd3d175417..bc1ef8a295 100644
  
  	/* Hold the core while its address configuration is written, so it
  	 * cannot fetch from a window it has not been given yet.
-@@ -449,23 +472,25 @@ static void nss_core_release(struct nss_core *core)
+@@ -449,25 +472,26 @@ static void nss_core_release(struct nss_core *core)
   */
  static void nss_core_halt(struct nss_core *core)
  {
@@ -103,11 +103,12 @@ index cd3d175417..bc1ef8a295 100644
  	if (!core->loaded)
  		return;
  
--	qca_ppe_fw_carrier_set(core->conduit, NULL);
+ 	core->load_cache_valid = false;
 +	WRITE_ONCE(core->c2c_ready, false);
 +	if (peer)
 +		WRITE_ONCE(peer->c2c_ready, false);
-+
+ 
+-	qca_ppe_fw_carrier_set(core->conduit, NULL);
 +	if (core->id == 0)
 +		qca_ppe_fw_carrier_set(core->conduit, NULL);
  	writel(1, core->nphys + NSS_CORE_RESET_CTRL);
@@ -126,7 +127,7 @@ index cd3d175417..bc1ef8a295 100644
  
  	/* Wait out any message or frame already past its running check: the
  	 * rings and the lent table go below.
-@@ -475,24 +500,28 @@ static void nss_core_halt(struct nss_core *core)
+@@ -477,24 +501,28 @@ static void nss_core_halt(struct nss_core *core)
  		core->msg.lost = false;
  	}
  	synchronize_net();
@@ -169,7 +170,7 @@ index cd3d175417..bc1ef8a295 100644
  
  	nss_pbuf_pool_free(core);
  	nss_mem_free_all(core);
-@@ -520,24 +549,38 @@ static void nss_core_halt(struct nss_core *core)
+@@ -522,24 +550,38 @@ static void nss_core_halt(struct nss_core *core)
   */
  static unsigned int nss_pool_size = 16384;
  module_param_named(pool_size, nss_pool_size, uint, 0644);
@@ -216,7 +217,7 @@ index cd3d175417..bc1ef8a295 100644
  }
  
  #define NSS_N2H_RPS_CFG			1
-@@ -588,7 +631,7 @@ static int nss_pool_set(struct nss_core *core, u32 payloads)
+@@ -590,7 +632,7 @@ static int nss_pool_set(struct nss_core *core, u32 payloads)
  
  	wm.cm.interface = NSS_INTERFACE_N2H;
  	wm.cm.type = NSS_N2H_SET_WATER_MARK;
@@ -225,7 +226,7 @@ index cd3d175417..bc1ef8a295 100644
  	wm.high_water = cpu_to_be32(payloads);
  
  	/* Recorded before the message goes out, because this is the first one
-@@ -652,10 +695,11 @@ static void nss_accel_in_core(struct nss_core *core)
+@@ -654,10 +696,11 @@ static void nss_accel_in_core(struct nss_core *core)
  static void nss_pool_configure(struct nss_core *core)
  {
  	struct nss_n2h_payload_info p = {};
@@ -239,7 +240,7 @@ index cd3d175417..bc1ef8a295 100644
  
  	p.cm.interface = NSS_INTERFACE_N2H;
  	p.cm.type = NSS_N2H_GET_WATER_MARK;
-@@ -689,7 +733,11 @@ struct nss_n2h_buf_pool {
+@@ -691,7 +734,11 @@ struct nss_n2h_buf_pool {
  
  static unsigned int nss_pbuf_bytes = 3100000;
  module_param_named(pbuf_bytes, nss_pbuf_bytes, uint, 0644);
@@ -252,7 +253,7 @@ index cd3d175417..bc1ef8a295 100644
  
  void nss_pbuf_pool_free(struct nss_core *core)
  {
-@@ -871,6 +919,90 @@ void nss_core_load_notify(struct nss_core *core, const struct nss_cmn_msg *ncm,
+@@ -880,6 +927,90 @@ void nss_core_load_notify(struct nss_core *core, const struct nss_cmn_msg *ncm,
  	core->load_samples++;
  }
  
@@ -343,7 +344,7 @@ index cd3d175417..bc1ef8a295 100644
  static int nss_core_boot(struct nss_core *core)
  {
  	int ret;
-@@ -880,8 +1012,8 @@ static int nss_core_boot(struct nss_core *core)
+@@ -889,8 +1020,8 @@ static int nss_core_boot(struct nss_core *core)
  	if (core->loaded)
  		return -EBUSY;
  
@@ -354,7 +355,7 @@ index cd3d175417..bc1ef8a295 100644
  		dev_err(core->dev, "EDMA not reset since a core last ran\n");
  		return -EAGAIN;
  	}
-@@ -907,10 +1039,12 @@ static int nss_core_boot(struct nss_core *core)
+@@ -916,10 +1047,12 @@ static int nss_core_boot(struct nss_core *core)
  	if (ret)
  		goto free;
  
@@ -369,7 +370,7 @@ index cd3d175417..bc1ef8a295 100644
  	nss_log_shadow_start(core);
  
  	/* A boot that timed out and was then answered leaves the completion
-@@ -928,29 +1062,36 @@ static int nss_core_boot(struct nss_core *core)
+@@ -937,29 +1070,36 @@ static int nss_core_boot(struct nss_core *core)
  		return -ETIMEDOUT;
  	}
  
@@ -423,7 +424,7 @@ index cd3d175417..bc1ef8a295 100644
  
  	return 0;
  
-@@ -982,7 +1123,8 @@ void nss_core_stop(struct nss_core *core)
+@@ -991,7 +1131,8 @@ void nss_core_stop(struct nss_core *core)
  void nss_core_fault(struct nss_core *core)
  {
  	core->running = false;
@@ -433,7 +434,7 @@ index cd3d175417..bc1ef8a295 100644
  	core->faulted = true;
  	schedule_work(&core->restart);
  }
-@@ -1019,28 +1161,35 @@ static void nss_core_restart(struct work_struct *work)
+@@ -1028,28 +1169,35 @@ static void nss_core_restart(struct work_struct *work)
  		/* The radios still hold buffers the dead core lent them, so
  		 * the WLAN driver's reset halts it, and resumes it after.
  		 */
@@ -477,7 +478,7 @@ index cd3d175417..bc1ef8a295 100644
  }
  
  static void nss_phys_work(struct work_struct *work)
-@@ -1056,7 +1205,7 @@ static int nss_boot_set(void *data, u64 val)
+@@ -1065,7 +1213,7 @@ static int nss_boot_set(void *data, u64 val)
  	WRITE_ONCE(core->up, val);
  
  	if (!val) {
@@ -486,7 +487,7 @@ index cd3d175417..bc1ef8a295 100644
  		    !wait_var_event_timeout(&core->loaded,
  					    !READ_ONCE(core->loaded),
  					    NSS_HALT_TIMEOUT))
-@@ -1064,19 +1213,25 @@ static int nss_boot_set(void *data, u64 val)
+@@ -1073,19 +1221,25 @@ static int nss_boot_set(void *data, u64 val)
  
  		scoped_guard(mutex, &core->lock)
  			nss_core_halt(core);
@@ -517,9 +518,9 @@ index cd3d175417..bc1ef8a295 100644
  
  	return 0;
  }
-@@ -1366,6 +1521,65 @@ static int nss_load_show(struct seq_file *s, void *unused)
- }
- DEFINE_SHOW_ATTRIBUTE(nss_load);
+@@ -1459,6 +1613,65 @@ static const struct attribute_group nss_sysfs_group = {
+ 	.attrs = nss_sysfs_attrs,
+ };
  
 +static int nss_c2c_show(struct seq_file *s, void *unused)
 +{
@@ -583,7 +584,7 @@ index cd3d175417..bc1ef8a295 100644
  static void nss_aux_clocks_put(void *data)
  {
  	struct nss_core *core = data;
-@@ -1486,6 +1700,9 @@ static int nss_probe(struct platform_device *pdev)
+@@ -1579,6 +1792,9 @@ static int nss_probe(struct platform_device *pdev)
  	ret = of_property_read_u32(dev->of_node, "qcom,id", &core->id);
  	if (ret)
  		return dev_err_probe(dev, ret, "no qcom,id\n");
@@ -593,7 +594,7 @@ index cd3d175417..bc1ef8a295 100644
  
  	ret = of_property_read_u32(dev->of_node, "qcom,load-addr", &load_addr);
  	if (ret)
-@@ -1497,7 +1714,11 @@ static int nss_probe(struct platform_device *pdev)
+@@ -1590,7 +1806,11 @@ static int nss_probe(struct platform_device *pdev)
  		return dev_err_probe(dev, ret, "no qcom,max-frequency\n");
  	core->core_rate = rate;
  
@@ -606,7 +607,7 @@ index cd3d175417..bc1ef8a295 100644
  	if (IS_ERR(core->nphys))
  		return PTR_ERR(core->nphys);
  
-@@ -1547,17 +1768,26 @@ static int nss_probe(struct platform_device *pdev)
+@@ -1640,21 +1860,30 @@ static int nss_probe(struct platform_device *pdev)
  		return dev_err_probe(dev, -ERANGE,
  				     "load address is outside the region\n");
  
@@ -627,11 +628,15 @@ index cd3d175417..bc1ef8a295 100644
 +	}
  
  	platform_set_drvdata(pdev, core);
++	WRITE_ONCE(nss_cores[core->id], core);
+ 
+ 	ret = devm_device_add_group(dev, &nss_sysfs_group);
+ 	if (ret)
+ 		dev_warn(dev, "sysfs load attribute failed: %d\n", ret);
 -	nss_wifili_bind(core);
 -	nss_flow_bind(core);
 -	nss_mc_bind(core);
 -	nss_redir_bind(core);
-+	WRITE_ONCE(nss_cores[core->id], core);
 +
 +	if (core->id == 0) {
 +		nss_wifili_bind(core);
@@ -642,7 +647,7 @@ index cd3d175417..bc1ef8a295 100644
  
  	core->debugfs = debugfs_create_dir(dev_name(dev), NULL);
  	debugfs_create_file("boot", 0600, core->debugfs, core, &nss_boot_fops);
-@@ -1566,27 +1796,30 @@ static int nss_probe(struct platform_device *pdev)
+@@ -1663,27 +1892,30 @@ static int nss_probe(struct platform_device *pdev)
  	debugfs_create_file("msg_probe", 0400, core->debugfs, core,
  			    &nss_probe_fops);
  	debugfs_create_file("rx", 0400, core->debugfs, core, &nss_rx_fops);
@@ -693,7 +698,7 @@ index cd3d175417..bc1ef8a295 100644
  
  	return 0;
  }
-@@ -1595,21 +1828,29 @@ static void nss_remove(struct platform_device *pdev)
+@@ -1692,21 +1924,29 @@ static void nss_remove(struct platform_device *pdev)
  {
  	struct nss_core *core = platform_get_drvdata(pdev);
  
@@ -733,7 +738,7 @@ index cd3d175417..bc1ef8a295 100644
  }
  
 diff --git a/package/kernel/nss-wifi-drv/src/nss_drv.h b/package/kernel/nss-wifi-drv/src/nss_drv.h
-index 0dbaca5bb4..1e886e6bb3 100644
+index 869c685000..fdca2a951e 100644
 --- a/package/kernel/nss-wifi-drv/src/nss_drv.h
 +++ b/package/kernel/nss-wifi-drv/src/nss_drv.h
 @@ -71,7 +71,9 @@
@@ -768,7 +773,7 @@ index 0dbaca5bb4..1e886e6bb3 100644
  /* The base virtual-device node, where the firmware keeps settings that
   * belong to every virtual device rather than to one of them.
   */
-@@ -366,6 +376,7 @@ struct nss_core {
+@@ -374,6 +384,7 @@ struct nss_core {
  	const struct nss_soc *soc;
  	const struct nss_fw_line *fw;
  	void __iomem *nphys;
@@ -776,7 +781,7 @@ index 0dbaca5bb4..1e886e6bb3 100644
  	void __iomem *qgic;
  	void __iomem *imem;
  	void __iomem *misc_reset;
-@@ -463,6 +474,12 @@ struct nss_core {
+@@ -475,6 +486,12 @@ struct nss_core {
  	u32 load_inst_max;
  	u32 load_samples;
  
@@ -789,7 +794,7 @@ index 0dbaca5bb4..1e886e6bb3 100644
  	struct clk_bulk_data clks[];
  };
  
-@@ -476,8 +493,11 @@ void nss_pbuf_pool_free(struct nss_core *core);
+@@ -488,8 +505,11 @@ void nss_pbuf_pool_free(struct nss_core *core);
  void nss_core_stop(struct nss_core *core);
  void nss_core_fault(struct nss_core *core);
  void nss_core_resume(struct nss_core *core);
@@ -890,6 +895,3 @@ index 356c0f8773..23db9e25ef 100644
  /*
   * CPU overclocking, off by default. The IPQ8174's own CPU PLL stops at
   * 1401.6 MHz; faster speeds come from GCC's GPLL2 (see the clk-qcom
--- 
-2.56.1
-

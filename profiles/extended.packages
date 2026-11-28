@@ -59,6 +59,7 @@ luci-app-usteer
 # Statistics
 luci-app-statistics
 collectd-mod-cpu
+collectd-mod-exec
 collectd-mod-interface
 collectd-mod-iwinfo
 collectd-mod-load

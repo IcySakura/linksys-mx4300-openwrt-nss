@@ -1,7 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Myles Liu <lyx981mike@gmail.com>
 Date: Thu, 26 Nov 2026 13:24:03 -0800
-Subject: [PATCH] nss-wifi-drv: initialize EIP-197 and nss_crypto_cmn on Core 1
+Subject: [PATCH 3/4] nss-wifi-drv: initialize EIP-197 and nss_crypto_cmn on
+ Core 1
 
 Add the MX4300 EIP-197 DT node (0x39880000, crypto clocks) and implement EIP-197 hardware initialization (reset, HIA/PE/FRC/TRC/FLUE setup, kernel CSPRNG seeding, ifpp/ipue/ofpp/opue firmware loading) and Core 1 nss_crypto_cmn context management with /sys/kernel/debug/39400000.nss/crypto diagnostics.
 ---
@@ -32,7 +33,7 @@ index 75968008a3..13f156d63d 100644
  ccflags-y += -I$(src)/include
  ccflags-y += -DCONFIG_NSS_WIFI_DRV=1
 diff --git a/package/kernel/nss-wifi-drv/src/nss_core.c b/package/kernel/nss-wifi-drv/src/nss_core.c
-index bc1ef8a295..a3ed74b67d 100644
+index 582dcea986..9e258c3025 100644
 --- a/package/kernel/nss-wifi-drv/src/nss_core.c
 +++ b/package/kernel/nss-wifi-drv/src/nss_core.c
 @@ -36,6 +36,7 @@
@@ -43,7 +44,7 @@ index bc1ef8a295..a3ed74b67d 100644
  
  /* Core control registers, in the "nphys" range. */
  #define NSS_CORE_RESET_CTRL		0x0004
-@@ -481,6 +482,9 @@ static void nss_core_halt(struct nss_core *core)
+@@ -482,6 +483,9 @@ static void nss_core_halt(struct nss_core *core)
  	if (peer)
  		WRITE_ONCE(peer->c2c_ready, false);
  
@@ -53,7 +54,7 @@ index bc1ef8a295..a3ed74b67d 100644
  	if (core->id == 0)
  		qca_ppe_fw_carrier_set(core->conduit, NULL);
  	writel(1, core->nphys + NSS_CORE_RESET_CTRL);
-@@ -1175,8 +1179,11 @@ static void nss_core_restart(struct work_struct *work)
+@@ -1183,8 +1187,11 @@ static void nss_core_restart(struct work_struct *work)
  	scoped_guard(mutex, &core->lock)
  		if (READ_ONCE(core->up) && !core->loaded)
  			ret = nss_core_boot(core);
@@ -66,7 +67,7 @@ index bc1ef8a295..a3ed74b67d 100644
  	/* After a fault the radios' interfaces are registered with the dead
  	 * instance; after a WLAN reset they are about to register again.
  	 */
-@@ -1227,6 +1234,9 @@ static int nss_boot_set(void *data, u64 val)
+@@ -1235,6 +1242,9 @@ static int nss_boot_set(void *data, u64 val)
  
  	nss_c2c_try_setup();
  
@@ -76,7 +77,7 @@ index bc1ef8a295..a3ed74b67d 100644
  	if (core->id == 0) {
  		nss_phys_arm_ports(core);
  		/* The radios' interfaces registered with the last instance. */
-@@ -1580,6 +1590,13 @@ static const struct file_operations nss_c2c_fops = {
+@@ -1672,6 +1682,13 @@ static const struct file_operations nss_c2c_fops = {
  	.release = single_release,
  };
  
@@ -90,7 +91,7 @@ index bc1ef8a295..a3ed74b67d 100644
  static void nss_aux_clocks_put(void *data)
  {
  	struct nss_core *core = data;
-@@ -1800,6 +1817,10 @@ static int nss_probe(struct platform_device *pdev)
+@@ -1896,6 +1913,10 @@ static int nss_probe(struct platform_device *pdev)
  	debugfs_create_file("load", 0400, core->debugfs, core, &nss_load_fops);
  	debugfs_create_file("c2c", 0600, core->debugfs, core, &nss_c2c_fops);
  
@@ -1205,6 +1206,3 @@ index 23db9e25ef..6022a4cc1f 100644
  /*
   * CPU overclocking, off by default. The IPQ8174's own CPU PLL stops at
   * 1401.6 MHz; faster speeds come from GCC's GPLL2 (see the clk-qcom
--- 
-2.56.1
-

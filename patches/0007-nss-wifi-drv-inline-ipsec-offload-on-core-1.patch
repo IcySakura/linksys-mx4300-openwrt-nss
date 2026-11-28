@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Myles Liu <lyx981mike@gmail.com>
 Date: Thu, 26 Nov 2026 13:35:20 -0800
-Subject: [PATCH] nss-wifi-drv: add inline IPsec offload on Core 1 via XFRM and
- C2C
+Subject: [PATCH 4/4] nss-wifi-drv: add inline IPsec offload on Core 1 via XFRM
+ and C2C
 
 ---
  .../nss-wifi-drv/files/nss-wifi.flowtable     |   13 +-
@@ -11,11 +11,11 @@ Subject: [PATCH] nss-wifi-drv: add inline IPsec offload on Core 1 via XFRM and
  package/kernel/nss-wifi-drv/src/nss_core.c    |   34 +-
  package/kernel/nss-wifi-drv/src/nss_flow.c    |   45 +-
  package/kernel/nss-wifi-drv/src/nss_fw.h      |    5 +
- package/kernel/nss-wifi-drv/src/nss_ipsec.c   | 1809 +++++++++++++++++
+ package/kernel/nss-wifi-drv/src/nss_ipsec.c   | 1832 +++++++++++++++++
  package/kernel/nss-wifi-drv/src/nss_ipsec.h   |   41 +
  package/kernel/nss-wifi-drv/src/nss_msg.c     |    9 +-
  package/kernel/nss-wifi-drv/src/nss_ring.c    |    5 +-
- 10 files changed, 1963 insertions(+), 15 deletions(-)
+ 10 files changed, 1986 insertions(+), 15 deletions(-)
  create mode 100644 package/kernel/nss-wifi-drv/src/nss_ipsec.c
  create mode 100644 package/kernel/nss-wifi-drv/src/nss_ipsec.h
 
@@ -82,7 +82,7 @@ index 13f156d63d..927fb8e1c1 100644
  ccflags-y += -I$(src)/include
  ccflags-y += -DCONFIG_NSS_WIFI_DRV=1
 diff --git a/package/kernel/nss-wifi-drv/src/nss_core.c b/package/kernel/nss-wifi-drv/src/nss_core.c
-index a3ed74b67d..51bc186703 100644
+index 9e258c3025..2c43c466fb 100644
 --- a/package/kernel/nss-wifi-drv/src/nss_core.c
 +++ b/package/kernel/nss-wifi-drv/src/nss_core.c
 @@ -37,6 +37,7 @@
@@ -93,7 +93,7 @@ index a3ed74b67d..51bc186703 100644
  
  /* Core control registers, in the "nphys" range. */
  #define NSS_CORE_RESET_CTRL		0x0004
-@@ -482,8 +483,10 @@ static void nss_core_halt(struct nss_core *core)
+@@ -483,8 +484,10 @@ static void nss_core_halt(struct nss_core *core)
  	if (peer)
  		WRITE_ONCE(peer->c2c_ready, false);
  
@@ -105,7 +105,7 @@ index a3ed74b67d..51bc186703 100644
  
  	if (core->id == 0)
  		qca_ppe_fw_carrier_set(core->conduit, NULL);
-@@ -1181,8 +1184,8 @@ static void nss_core_restart(struct work_struct *work)
+@@ -1189,8 +1192,8 @@ static void nss_core_restart(struct work_struct *work)
  			ret = nss_core_boot(core);
  	if (!ret && READ_ONCE(core->running)) {
  		nss_c2c_try_setup();
@@ -116,7 +116,7 @@ index a3ed74b67d..51bc186703 100644
  	}
  	/* After a fault the radios' interfaces are registered with the dead
  	 * instance; after a WLAN reset they are about to register again.
-@@ -1234,8 +1237,8 @@ static int nss_boot_set(void *data, u64 val)
+@@ -1242,8 +1245,8 @@ static int nss_boot_set(void *data, u64 val)
  
  	nss_c2c_try_setup();
  
@@ -127,7 +127,7 @@ index a3ed74b67d..51bc186703 100644
  
  	if (core->id == 0) {
  		nss_phys_arm_ports(core);
-@@ -1597,6 +1600,13 @@ static int nss_crypto_show(struct seq_file *s, void *unused)
+@@ -1689,6 +1692,13 @@ static int nss_crypto_show(struct seq_file *s, void *unused)
  }
  DEFINE_SHOW_ATTRIBUTE(nss_crypto);
  
@@ -141,7 +141,7 @@ index a3ed74b67d..51bc186703 100644
  static void nss_aux_clocks_put(void *data)
  {
  	struct nss_core *core = data;
-@@ -1817,9 +1827,12 @@ static int nss_probe(struct platform_device *pdev)
+@@ -1913,9 +1923,12 @@ static int nss_probe(struct platform_device *pdev)
  	debugfs_create_file("load", 0400, core->debugfs, core, &nss_load_fops);
  	debugfs_create_file("c2c", 0600, core->debugfs, core, &nss_c2c_fops);
  
@@ -155,7 +155,7 @@ index a3ed74b67d..51bc186703 100644
  
  	if (core->id == 0) {
  		debugfs_create_file("wifili_start", 0400, core->debugfs, core,
-@@ -1910,12 +1923,18 @@ static int __init nss_module_init(void)
+@@ -2006,12 +2019,18 @@ static int __init nss_module_init(void)
  	if (ret)
  		goto mc;
  
@@ -175,7 +175,7 @@ index a3ed74b67d..51bc186703 100644
  redir:
  	nss_redir_exit();
  mc:
-@@ -1930,6 +1949,7 @@ module_init(nss_module_init);
+@@ -2026,6 +2045,7 @@ module_init(nss_module_init);
  static void __exit nss_module_exit(void)
  {
  	platform_driver_unregister(&nss_driver);
@@ -306,10 +306,10 @@ index 1b3759bd42..543d930838 100644
  	NSS_DYNAMIC_INTERFACE_TYPE_WIFI_MESH_INNER = 70,
 diff --git a/package/kernel/nss-wifi-drv/src/nss_ipsec.c b/package/kernel/nss-wifi-drv/src/nss_ipsec.c
 new file mode 100644
-index 0000000000..22842a0489
+index 0000000000..eff237b99b
 --- /dev/null
 +++ b/package/kernel/nss-wifi-drv/src/nss_ipsec.c
-@@ -0,0 +1,1809 @@
+@@ -0,0 +1,1832 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/* Inline IPsec offload on NSS Core 1 (nss_ipsec_cmn + EIP-197 + C2C).
 + *
@@ -1842,7 +1842,10 @@ index 0000000000..22842a0489
 +
 +	switch (event) {
 +	case NETDEV_UP:
-+		nss_ipsec_xfrm_dev_bind(dev);
++	case NETDEV_CHANGE:
++	case NETDEV_REGISTER:
++		if (dev->flags & IFF_UP)
++			nss_ipsec_xfrm_dev_bind(dev);
 +		break;
 +	case NETDEV_GOING_DOWN:
 +	case NETDEV_UNREGISTER:
@@ -1851,6 +1854,17 @@ index 0000000000..22842a0489
 +	}
 +
 +	return NOTIFY_DONE;
++}
++
++static void nss_ipsec_scan_xfrm_dev(void)
++{
++	struct net_device *dev;
++
++	rtnl_lock();
++	for_each_netdev(&init_net, dev)
++		if (dev->flags & IFF_UP)
++			nss_ipsec_xfrm_dev_bind(dev);
++	rtnl_unlock();
 +}
 +
 +static struct notifier_block nss_ipsec_nb = {
@@ -1865,10 +1879,12 @@ index 0000000000..22842a0489
 +	if (core->id != 1 || !nss_ipsec_enable || !nss_crypto_ready())
 +		return 0;
 +
-+	guard(mutex)(&nss_ipsec_lock);
++	mutex_lock(&nss_ipsec_lock);
 +
-+	if (nss_ipsec.ready)
++	if (nss_ipsec.ready) {
++		mutex_unlock(&nss_ipsec_lock);
 +		return 0;
++	}
 +
 +	/* 1. Configure Core 1 IPsec base node (EIP-197 lookaside DMA enabled). */
 +	m.msg.node.dma_lookaside = 1;
@@ -1880,14 +1896,18 @@ index 0000000000..22842a0489
 +	if (ret) {
 +		dev_err(core->dev, "ipsec: NODE_CONFIG failed: %d (err %u)\n",
 +			ret, m.cm.error);
++		mutex_unlock(&nss_ipsec_lock);
 +		return ret;
 +	}
 +
 +	/* 2. Allocate the 4 dynamic IPsec interfaces on Core 1. */
 +	nss_ipsec.inner_if = nss_flow_dyn_alloc(core,
 +			NSS_DYNAMIC_INTERFACE_TYPE_IPSEC_CMN_INNER);
-+	if (nss_ipsec.inner_if < 0)
-+		return nss_ipsec.inner_if;
++	if (nss_ipsec.inner_if < 0) {
++		ret = nss_ipsec.inner_if;
++		mutex_unlock(&nss_ipsec_lock);
++		return ret;
++	}
 +
 +	nss_ipsec.mdata_inner_if = nss_flow_dyn_alloc(core,
 +			NSS_DYNAMIC_INTERFACE_TYPE_IPSEC_CMN_MDATA_INNER);
@@ -1959,6 +1979,8 @@ index 0000000000..22842a0489
 +		 nss_ipsec.inner_if_c1, nss_ipsec.outer_if,
 +		 nss_ipsec.mdata_outer_if, nss_ipsec.outer_if_c1);
 +
++	mutex_unlock(&nss_ipsec_lock);
++	nss_ipsec_scan_xfrm_dev();
 +	return 0;
 +
 +err_mdata_outer:
@@ -1977,6 +1999,7 @@ index 0000000000..22842a0489
 +	nss_flow_dyn_free(core, NSS_DYNAMIC_INTERFACE_TYPE_IPSEC_CMN_INNER,
 +			  nss_ipsec.inner_if);
 +	nss_ipsec.inner_if = -1;
++	mutex_unlock(&nss_ipsec_lock);
 +	return ret;
 +}
 +
